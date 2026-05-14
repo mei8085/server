@@ -18,7 +18,16 @@
 | 3 | Header `Authorization` | Bearer 认证 | `Authorization: Bearer xxxxxx` |
 | 4 | Cookie | Cookie `gotify-client-token` | 浏览器自动携带 |
 
-**重要规则：先命中先使用，命中后即使无效也不回退**。即只要某一优先级来源存在值（即使为空或无效），就会锁定该来源进行验证，不会尝试从更低优先级来源提取 Token。
+**重要规则：先命中非空值先使用，值为空则继续回退**。即某一优先级来源存在但值为空（如 `?token=`）时，会继续尝试下一优先级来源；只有提取到非空值时才会锁定该来源进行验证，不会再回退。
+
+代码依据 (`auth/authentication.go:206-213`):
+```go
+if token := a.tokenFromQuery(ctx); token != "" {  // 只有非空才返回
+    return token, false
+} else if token := a.tokenFromXGotifyHeader(ctx); token != "" {
+    return token, false
+}
+```
 
 ## 3. 认证方法组合与优先级
 
@@ -117,8 +126,9 @@
 以下矩阵覆盖 cookie、query、header、basic 同时出现时的组合判定场景。
 
 **符号说明**：
-- ✓：有效凭据
-- ✗：无效凭据
+- ✓：有效凭据（非空且有效）
+- ✗：无效凭据（非空但无效）
+- ∅：来源存在但值为空（如 `?token=`）
 - -：未提供凭据
 - (Q)：Query 参数
 - (H)：Header `X-Gotify-Key`
@@ -130,21 +140,27 @@
 
 | 序号 | Basic (B) | Query (Q) | Header (H) | Auth (A) | Cookie (C) | 实际使用 | 结果 | 说明 |
 |------|-----------|-----------|------------|----------|------------|----------|------|------|
-| 1 | - | ✓ | ✓ | ✓ | ✓ | B 无 → Q | 200 | Q 有效，直接使用 |
-| 2 | - | ✗ | ✓ | ✓ | ✓ | Q | 401 | Q 无效，不回退到 H/A/C |
-| 3 | - | - | ✓ | ✓ | ✓ | H | 200 | H 有效 |
-| 4 | - | - | ✗ | ✓ | ✓ | H | 401 | H 无效，不回退到 A/C |
-| 5 | - | - | - | ✓ | ✓ | A | 200 | A 有效 |
-| 6 | - | - | - | ✗ | ✓ | A | 401 | A 无效，不回退到 C |
-| 7 | - | - | - | - | ✓ | C | 200 | C 有效 |
-| 8 | - | - | - | - | ✗ | C | 401 | C 无效 |
-| 9 | ✓ | ✓ | ✓ | ✓ | ✓ | B | 200 | Basic Auth 优先级最高，Token 全部忽略 |
-| 10 | ✗ | ✓ | ✓ | ✓ | ✓ | B 失败 → Q | 200 | B 无效，回退到 Token 验证，使用 Q |
-| 11 | ✗ | ✗ | ✓ | ✓ | ✓ | B 失败 → Q | 401 | B 无效，Q 也无效，不继续回退 |
-| 12 | - | ✓ | - | - | ✓ | Q | 200 | Q 优先于 C |
-| 13 | - | ✗ | - | - | ✓ | Q | 401 | Q 无效，不回退到 C |
-| 14 | ✓ | ✗ | ✗ | ✗ | ✗ | B | 200 | B 有效，Token 无效不影响 |
-| 15 | ✗ | ✗ | ✗ | ✗ | ✗ | B 失败 → Q | 401 | 全部无效 |
+| 1 | - | ✓ | ✓ | ✓ | ✓ | B 无 → Q | 200 | Q 非空有效，直接使用 |
+| 2 | - | ✗ | ✓ | ✓ | ✓ | Q | 401 | Q 非空无效，**不回退**到 H/A/C |
+| 3 | - | ∅ | ✓ | ✓ | ✓ | Q 空 → H | 200 | Q 为空，回退到 H，H 有效 |
+| 4 | - | ∅ | ✗ | ✓ | ✓ | Q 空 → H | 401 | Q 为空回退到 H，H 无效不继续回退 |
+| 5 | - | - | ✓ | ✓ | ✓ | H | 200 | H 有效 |
+| 6 | - | - | ✗ | ✓ | ✓ | H | 401 | H 无效，不回退到 A/C |
+| 7 | - | - | ∅ | ✓ | ✓ | H 空 → A | 200 | H 为空回退到 A |
+| 8 | - | - | - | ✓ | ✓ | A | 200 | A 有效 |
+| 9 | - | - | - | ✗ | ✓ | A | 401 | A 无效，不回退到 C |
+| 10 | - | - | - | ∅ | ✓ | A 空 → C | 200 | A 为空回退到 C |
+| 11 | - | - | - | - | ✓ | C | 200 | C 有效 |
+| 12 | - | - | - | - | ✗ | C | 401 | C 无效 |
+| 13 | ✓ | ✓ | ✓ | ✓ | ✓ | B | 200 | Basic Auth 优先级最高，Token 全部忽略 |
+| 14 | ✗ | ✓ | ✓ | ✓ | ✓ | B 失败 → Q | 200 | B 无效，回退到 Token 验证，使用 Q |
+| 15 | ✗ | ✗ | ✓ | ✓ | ✓ | B 失败 → Q | 401 | B 无效，Q 也无效不继续回退 |
+| 16 | ✗ | ∅ | ✓ | ✓ | ✓ | B 失败 → Q 空 → H | 200 | B 无效，Q 为空回退到 H |
+| 17 | - | ✓ | - | - | ✓ | Q | 200 | Q 优先于 C |
+| 18 | - | ✗ | - | - | ✓ | Q | 401 | Q 非空无效，**不回退**到 C |
+| 19 | - | ∅ | - | - | ✓ | Q 空 → C | 200 | Q 为空，回退到 C |
+| 20 | ✓ | ✗ | ✗ | ✗ | ✗ | B | 200 | B 有效，Token 无效不影响 |
+| 21 | ✗ | ✗ | ✗ | ✗ | ✗ | B 失败 → Q | 401 | 全部无效 |
 
 ### 5.2 RequireApplicationToken 组合矩阵（401 vs 403 差异）
 
@@ -152,13 +168,17 @@
 |------|-----------|-----------|----------|------|------|
 | 1 | - | ✓ (App) | Q | 200 | App Token 有效 |
 | 2 | - | ✓ (Client) | Q | 401 | Client Token 不是 App Token，且无有效 B |
-| 3 | ✓ (用户) | - | Q 无 → B 检查 | 403 | 无 App Token，但 B 有效 |
-| 4 | ✗ | - | Q 无 → B 检查 | 401 | 无 App Token，且 B 无效 |
-| 5 | ✓ (用户) | ✗ | Q 无效 → B 检查 | 403 | Q 无效，但 B 有效 → 返回 403 |
-| 6 | ✓ (用户) | ✓ (Client) | Q | 403 | Q 是 Client Token 无效，B 有效 → 返回 403 |
-| 7 | ✗ | ✓ (Client) | Q | 401 | Q 是 Client Token 无效，B 也无效 → 返回 401 |
+| 3 | - | ∅ | Q 空 → 无 Token | 401 | Q 为空，继续检查其他来源，最终无有效 Token |
+| 4 | ✓ (用户) | - | Q 无 → B 检查 | 403 | 无 App Token，但 B 有效 |
+| 5 | ✗ | - | Q 无 → B 检查 | 401 | 无 App Token，且 B 无效 |
+| 6 | ✓ (用户) | ✗ | Q 无效 → B 检查 | 403 | Q 非空无效，但 B 有效 → 返回 403 |
+| 7 | ✓ (用户) | ∅ | Q 空 → 其他 → B 检查 | 403 | Q 为空回退，最终无有效 Token，B 有效 → 403 |
+| 8 | ✓ (用户) | ✓ (Client) | Q | 403 | Q 是 Client Token 无效，B 有效 → 返回 403 |
+| 9 | ✗ | ✓ (Client) | Q | 401 | Q 是 Client Token 无效，B 也无效 → 返回 401 |
 
-**关键更正**：高优先级 Token 无效但 Basic Auth 有效时，返回 **403**，不是 401！
+**关键更正 1**：高优先级 Token 无效（非空）但 Basic Auth 有效时，返回 **403**，不是 401！
+
+**关键更正 2**：高优先级 Token **为空**值时，会继续回退到下一优先级！
 
 ### 5.3 RequireAdmin 组合矩阵（403 场景）
 
@@ -168,13 +188,15 @@
 | 2 | ✓ (普通用户) | ✓ | B | 403 | 认证成功但无权限 |
 | 3 | - | ✓ (普通用户) | Q | 403 | Token 有效但用户非管理员 |
 | 4 | - | ✓ (管理员但未提升) | Q | 403 | session not elevated |
-| 5 | - | ✗ (管理员) | Q | 401 | Token 无效 |
-| 6 | ✓ (普通用户) | ✗ | B | 403 | B 有效但非管理员 |
-| 7 | ✗ | ✓ (管理员但未提升) | B 失败 → Q | 403 | B 无效，Q 有效但未提升 |
+| 5 | - | ✗ (管理员) | Q | 401 | Token 非空无效 |
+| 6 | - | ∅ | Q 空 → 其他 | 401 | Q 为空，无其他有效 Token |
+| 7 | ✓ (普通用户) | ✗ | B | 403 | B 有效但非管理员 |
+| 8 | ✗ | ✓ (管理员但未提升) | B 失败 → Q | 403 | B 无效，Q 有效但未提升 |
+| 9 | ✗ | ∅ | B 失败 → Q 空 → 其他 | 401 | B 无效，Q 为空无其他有效 Token |
 
 ## 6. 典型场景分析
 
-### 场景 1：高优先级无效，低优先级有效
+### 场景 1：高优先级非空无效，低优先级有效
 
 **请求**：
 ```
@@ -185,12 +207,28 @@ Cookie: gotify-client-token=ValidClientToken
 **访问**：RequireClient 端点
 
 **结果**：
-- Query 参数优先命中 `InvalidToken`
+- Query 参数命中 `InvalidToken`（非空）
 - 验证失败
 - **不回退**到 Cookie
 - 返回 401
 
-### 场景 2：高优先级 Token 无效 + 有效 Basic Auth（关键更正场景）
+### 场景 2：高优先级值为空，低优先级有效
+
+**请求**：
+```
+GET /message?token=
+Cookie: gotify-client-token=ValidClientToken
+```
+
+**访问**：RequireClient 端点
+
+**结果**：
+- Query 参数值为空
+- 检测到 `token == ""`，**继续回退**到 Cookie
+- Cookie Token 验证成功
+- 返回 200
+
+### 场景 3：高优先级 Token 非空无效 + 有效 Basic Auth
 
 **请求**：
 ```
@@ -206,7 +244,23 @@ Authorization: Basic valid-user-credentials
 - 返回 **403**（不是 401）
 - 原因：认证有效但不允许用户认证访问应用端点
 
-### 场景 3：请求同时包含 Cookie 和 Header Token
+### 场景 4：高优先级 Token 值为空 + 有效 Basic Auth
+
+**请求**：
+```
+POST /message?token=
+Authorization: Basic valid-user-credentials
+```
+
+**访问**：RequireApplicationToken 端点
+
+**结果**：
+- Query Token 为空，继续检查其他 Token 来源
+- 无其他有效 Token
+- 检查 Basic Auth → 有效用户认证
+- 返回 **403**
+
+### 场景 5：请求同时包含 Cookie 和 Header Token
 
 **请求**：
 ```
@@ -218,7 +272,7 @@ X-Gotify-Key: HeaderToken456
 - 优先使用 `X-Gotify-Key` 中的 `HeaderToken456`
 - Cookie 中的 Token 被忽略
 
-### 场景 4：请求同时包含 Basic Auth 和 Client Token
+### 场景 6：请求同时包含 Basic Auth 和 Client Token
 
 **请求**：
 ```
@@ -231,7 +285,7 @@ X-Gotify-Key: ClientToken123
 - 如果用户凭据有效 → 使用用户身份，Token 被忽略
 - 如果用户凭据无效 → 回退到 Token 验证
 
-### 场景 5：Cookie 中的 Token 是 Application Token
+### 场景 7：Cookie 中的 Token 是 Application Token
 
 **请求**：
 ```
@@ -245,7 +299,7 @@ Cookie: gotify-client-token=AppToken_A123
 - 验证为有效 Application Token
 - 认证成功
 
-### 场景 6：Cookie 中的 Token 是 Client Token，访问应用端点
+### 场景 8：Cookie 中的 Token 是 Client Token，访问应用端点
 
 **请求**：
 ```
@@ -260,21 +314,21 @@ Cookie: gotify-client-token=ClientToken_C123
 - 检查是否有 Basic Auth → 无
 - 返回 401
 
-### 场景 7：同时提供 Query Token 和 Cookie Token，Query 无效
+### 场景 9：同时提供 Query Token（空）和 Cookie Token（有效）
 
 **请求**：
 ```
-GET /message?token=InvalidQueryToken
+GET /message?token=
 Cookie: gotify-client-token=ValidCookieToken
 ```
 
 **结果**：
-- 优先使用 Query 参数中的 `InvalidQueryToken`
-- 验证失败
-- **不回退**到 Cookie 中的有效 Token
-- 返回 401
+- Query 参数值为空
+- 检测到空值，**继续回退**到 Cookie
+- Cookie Token 验证成功
+- 返回 200
 
-### 场景 8：有效 Basic Auth + 无效 Token
+### 场景 10：有效 Basic Auth + 无效 Token
 
 **请求**：
 ```
@@ -287,7 +341,7 @@ X-Gotify-Key: InvalidToken
 - Token 被完全忽略
 - 返回 200
 
-### 场景 9：无效 Basic Auth + 有效 Token
+### 场景 11：无效 Basic Auth + 有效 Token
 
 **请求**：
 ```
@@ -300,7 +354,7 @@ X-Gotify-Key: ValidClientToken
 - 回退到 Token 验证
 - Token 有效 → 返回 200
 
-### 场景 10：Client Token 有效但非管理员，访问管理员端点
+### 场景 12：Client Token 有效但非管理员，访问管理员端点
 
 **请求**：
 ```
@@ -333,7 +387,48 @@ X-Gotify-Key: ValidClientTokenOfNormalUser
 
 ## 9. 认证状态流转
 
-### 9.1 RequireClient / RequireAdmin / RequireElevatedClient 流程
+### 9.1 Token 提取流程
+
+```
+请求到达
+    ↓
+┌───────────────────────────────────────────────┐
+│  检查 Query 参数 ?token=                        │
+└───────────────────────────────────────────────┘
+    ↓
+    ├────── 非空 ──────┐
+    ↓                   ↓
+┌─────────────┐   ┌──────────────────────────────┐
+│ 验证 Token? │   │ 检查 Header X-Gotify-Key      │
+└─────────────┘   └──────────────────────────────┘
+    ↓ 成功              ↓
+    ↓ 200              ├────── 非空 ──────┐
+    ↓                  ↓                   ↓
+┌─────────────┐   ┌─────────────┐   ┌──────────────────────────────┐
+│ 验证失败?   │   │ 验证 Token? │   │ 检查 Header Authorization     │
+│ 返回 401    │   └─────────────┘   └──────────────────────────────┘
+└─────────────┘       ↓ 成功              ↓
+                      ↓ 200              ├────── 非空 ──────┐
+                      ↓                  ↓                   ↓
+                   ┌─────────────┐   ┌─────────────┐   ┌──────────────────────┐
+                   │ 验证失败?   │   │ 验证 Token? │   │ 检查 Cookie           │
+                   │ 返回 401    │   └─────────────┘   └──────────────────────┘
+                   └─────────────┘       ↓ 成功              ↓
+                                         ↓ 200              ├────── 非空 ──────┐
+                                         ↓                  ↓                   ↓
+                                      ┌─────────────┐   ┌─────────────┐   ┌────────────┐
+                                      │ 验证失败?   │   │ 验证 Token? │   │ 返回空字符串│
+                                      │ 返回 401    │   └─────────────┘   └────────────┘
+                                      └─────────────┘       ↓ 成功
+                                                           ↓ 200
+                                                           ↓
+                                                        ┌─────────────┐
+                                                        │ 验证失败?   │
+                                                        │ 返回 401    │
+                                                        └─────────────┘
+```
+
+### 9.2 RequireClient / RequireAdmin / RequireElevatedClient 流程
 
 ```
 请求到达
@@ -353,7 +448,7 @@ X-Gotify-Key: ValidClientTokenOfNormalUser
 ┌─────────────────────────────────┐    └──────┘
 │  按优先级提取 Token              │
 │  Query → Header → Auth → Cookie │
-│  先命中先使用，不回退           │
+│  非空锁定，空值回退              │
 └─────────────────────────────────┘
     ↓
 ┌─────────────┐
@@ -373,7 +468,7 @@ X-Gotify-Key: ValidClientTokenOfNormalUser
 └─────────────┘
 ```
 
-### 9.2 RequireApplicationToken 流程
+### 9.3 RequireApplicationToken 流程
 
 ```
 请求到达
@@ -381,7 +476,7 @@ X-Gotify-Key: ValidClientTokenOfNormalUser
 ┌─────────────────────────────────┐
 │  按优先级提取 Token              │
 │  Query → Header → Auth → Cookie │
-│  先命中先使用，不回退           │
+│  非空锁定，空值回退              │
 └─────────────────────────────────┘
     ↓
 ┌───────────────────┐
@@ -411,7 +506,7 @@ X-Gotify-Key: ValidClientTokenOfNormalUser
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
-| Token 提取优先级 | `auth/authentication.go` | 205-216 |
+| Token 提取优先级（空值判断） | `auth/authentication.go` | 205-216 |
 | 认证评估逻辑 | `auth/authentication.go` | 84-112 |
 | RequireClient 逻辑 | `auth/authentication.go` | 52-54 |
 | RequireAdmin 逻辑 | `auth/authentication.go` | 46-48 |
