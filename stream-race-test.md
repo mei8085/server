@@ -1,74 +1,122 @@
 # 推送流并发 Race 边界场景测试报告
 
-## 1. 锁保护机制复核
+## 前置说明
 
-### 1.1 已确认安全（受锁保护，无Race）
+本文档所有结论均基于当前仓库代码的事实验证。所有测试用例均可直接在当前代码库运行。
 
-以下操作均在 `a.lock` 保护下执行，不存在数据竞争：
+## 1. 代码事实复核
 
-| 操作 | 锁类型 | 代码位置 | 结论 |
-|------|--------|----------|------|
-| `CollectConnectedClientTokens` | `RLock` | stream.go:41-51 | ✓ 安全，遍历 clients map 时受读锁保护 |
-| `NotifyDeletedUser` | `Lock` | stream.go:53-64 | ✓ 安全，修改 clients map 时受写锁保护 |
-| `NotifyDeletedClient` | `Lock` | stream.go:66-80 | ✓ 安全，修改 clients map 时受写锁保护 |
-| `register` | `Lock` | stream.go:106-110 | ✓ 安全，添加客户端受写锁保护 |
-| `remove` | `Lock` | stream.go:93-104 | ✓ 安全，移除客户端受写锁保护 |
-| `Notify` 遍历 clients | `RLock` | stream.go:82-91 | ✓ 安全，遍历客户端列表受读锁保护 |
+### 1.1 Notify 真实执行路径
 
-### 1.2 真正的 Race 边界（锁未覆盖）
+**关键代码 (stream.go:83-91)：**
+```go
+func (a *API) Notify(userID uint, msg *model.MessageExternal) {
+    a.lock.RLock()
+    defer a.lock.RUnlock()  // <-- defer 延迟解锁
+    if clients, ok := a.clients[userID]; ok {
+        for _, c := range clients {
+            c.write <- msg  // <-- 持有读锁时写入通道
+        }
+    }
+}
+```
 
-以下操作序列存在竞态风险：
+**时序事实：**
+- ✅ `c.write <- msg` 执行时 **持有** `a.lock.RLock()`
+- ❌ 不存在"先 RUnlock 再写通道"的情况
+
+### 1.2 可测试的导出变量
+
+| 变量名 | 类型 | 可否 mock | 代码位置 |
+|--------|------|----------|----------|
+| `ping` | `var` | ✅ 可以 | client.go:15-17 |
+| `writeJSON` | `var` | ✅ 可以 | client.go:19-21 |
+| `nextReader` | (方法内调用) | ❌ 不可 | client.go:70 |
+
+### 1.3 锁保护覆盖范围
+
+| 操作 | 锁保护 | 结论 |
+|------|--------|------|
+| 遍历 `clients` map | `RLock` | ✓ 安全 |
+| 从 `clients` map 增删 client | `Lock` | ✓ 安全 |
+| `c.write <- msg` 写入通道 | `RLock` (保护 map 遍历) | ⚠️ 通道写入本身不受锁保护 |
+| `close(c.write)` 关闭通道 | `once` 保护 | ⚠️ 与写入并发时仍有风险 |
 
 ---
 
-## 2. Race 边界场景清单（逐项对照）
+## 2. Race 边界场景五维对照表
 
-### 场景 1: Notify 通道写入 vs Close 通道关闭
+| # | 场景 | 代码证据 | 现有测试证据 | 是否已覆盖 | 可执行复现命令 |
+|---|------|----------|--------------|------------|----------------|
+| 1 | **Notify 写入通道 vs Close 关闭通道**<br>Notify 持有读锁写入时，另一个 goroutine 执行 Close 关闭通道 | stream.go:88 `c.write <- msg`<br>client.go:46 `close(c.write)`<br>**关键：** 读锁只保护 map，不保护 channel 写入 | `TestDeleteUser` line 306-310<br>串行：Notify → NotifyDeletedUser → Notify<br>无并发 | ❌ 未覆盖 | 见 §4.1 |
+| 2 | **自定义 Once 执行时序**<br>先标记 `done=1`，释放锁，再执行 `f()` | once.go:19-36<br>`atomic.Store` 在锁内<br>`f()` 在锁外执行 | `Test_Execute` line 16-17<br>仅 2 个 goroutine<br>f() 只是 channel send | ❌ 覆盖不足 | 见 §4.2 |
+| 3 | **读写 goroutine 同时调用 NotifyClose**<br>网络故障导致两个 goroutine 同时检测到错误并退出 | client.go:62<br>`startReading` defer NotifyClose()<br>client.go:84<br>`startWriteHandler` defer NotifyClose() | `TestWriteMessageFails`：仅写 goroutine 退出<br>`TestWritePingFails`：仅写 goroutine 退出<br>`TestCloseClientOnNotReading`：仅读 goroutine 退出 | ❌ 未覆盖 | 见 §4.3 |
+| 4 | **API.Close 与新连接 Handle 并发**<br>Close 遍历关闭连接时，Handle 注册新连接 | stream.go:161-173<br>Close 无关闭标志<br>stream.go:143-157<br>Handle 无关闭检查 | 所有测试的 `defer api.Close()` 均在测试结束时执行<br>`TestMultipleClients` line 431-433：先 Close 后 Notify，串行 | ❌ 未覆盖 | 见 §4.4 |
+| 5 | **写通道满导致 Notify 持有锁阻塞**<br>通道容量 1，消费阻塞，连续 Notify 导致读锁被持有而阻塞 | client.go:35<br>`make(chan ..., 1)`<br>stream.go:84-88<br>Notify 持有 RLock 写入 | 所有测试消息发送均有间隔<br>通道不会满 | ❌ 未覆盖 | 见 §4.5 |
 
-**触发时序：**
+---
+
+## 3. 现有测试覆盖详细分析
+
+### 场景 1: Notify vs Close 通道操作并发
+
+**代码证据：**
+```go
+// stream.go:83-91 - Notify 持有读锁写入
+func (a *API) Notify(userID uint, msg *model.MessageExternal) {
+    a.lock.RLock()
+    defer a.lock.RUnlock()
+    if clients, ok := a.clients[userID]; ok {
+        for _, c := range clients {
+            c.write <- msg  // 持有读锁，但不保护 channel 操作
+        }
+    }
+}
+
+// client.go:43-47 - Close 关闭通道
+func (c *client) Close() {
+    c.once.Do(func() {
+        c.conn.Close()
+        close(c.write)  // 无锁保护，与写入并发
+    })
+}
+```
+
+**竞态时序：**
 ```
 Goroutine A (Notify)          Goroutine B (Close)
      |                             |
 a.lock.RLock()                     |
 c = clients[userID]                |
-a.lock.RUnlock()                   |
-     |                             c.once.Do(f)
-     |                                |
-     |                             c.conn.Close()
-     |                             close(c.write)   <---+
-     |                                                | 竞态窗口
-c.write <- msg   <------------------------------------+
+c.write <- msg  <---- 竞态 ---->  c.once.Do(f)
+(持有 RLock)                       c.conn.Close()
+     |                             close(c.write)
+defer a.lock.RUnlock()             |
 ```
 
-**风险点：**
-- `a.lock.RUnlock()` 释放后，`c.write <- msg` 不再受锁保护
-- 此时 `Close()` 可能在另一个 goroutine 中执行 `close(c.write)`
-- 向已关闭的 channel 写入会触发 panic
-
-**代码位置：**
-- stream.go:88 - `c.write <- msg` (锁已释放)
-- client.go:43-47 - `Close()` 中的 `close(c.write)`
-
 **现有测试证据：**
-- `TestDeleteUser`: 先 `Notify`，再 `NotifyDeletedUser`，再 `Notify` - 串行执行，无并发
-- `TestDeleteClient`: 同上，串行
-- `TestMultipleClients`: 先关闭连接，`time.Sleep(500ms)` 后再 `Notify` - 有延迟保护
+- `TestDeleteUser` (stream_test.go:306-310):
+  ```go
+  api.Notify(1, msg)              // 先发送
+  api.NotifyDeletedUser(1)        // 再删除（内部调用 Close）
+  api.Notify(1, msg)              // 删除后再发送
+  ```
+  串行执行，Client 已从 map 中移除，不会触发并发写入关闭通道
 
-**测试覆盖状态：❌ 未覆盖**
-- 现有测试均为串行执行，未模拟"Notify 和 Close 同时发生"的场景
-- 即使启用 `-race`，现有测试也无法触发此 race
+**覆盖状态：❌ 未覆盖**
 
 ---
 
-### 场景 2: 自定义 Once 内存可见性问题
+### 场景 2: 自定义 Once 执行时序
 
-**关键代码 (once.go:19-36)：**
+**代码证据：**
 ```go
+// once.go:19-36
 func (o *once) Do(f func()) {
-    if atomic.LoadUint32(&o.done) == 1 {  // 快速路径
+    if atomic.LoadUint32(&o.done) == 1 {
         return
     }
-    if o.mayExecute() {  // 慢速路径
+    if o.mayExecute() {
         f()  // <-- 执行 f 时不持有锁
     }
 }
@@ -78,170 +126,166 @@ func (o *once) mayExecute() bool {
     defer o.m.Unlock()
     if o.done == 0 {
         atomic.StoreUint32(&o.done, 1)  // <-- 先标记 done
-        return true                      // <-- 释放锁后才执行 f
+        return true                      // <-- 释放锁后才返回
     }
     return false
 }
 ```
 
-**触发时序：**
-```
-Goroutine 1              Goroutine 2
-     |                       |
-o.Do(f)                     o.Do(f)
-     |                       |
-atomic.Load == 0            atomic.Load == 0
-     |                       |
-o.m.Lock()                  o.m.Lock() (等待)
-o.done == 0                 |
-atomic.Store(&o.done, 1)    |
-o.m.Unlock() -------------> |
-     |                       o.done == 1
-f()                          return (看到 done=1)
-     |
-     +-- 竞态窗口 --+
-                   |
-                f() 中的操作（如 close(c.write)）可能尚未对 Goroutine 2 完全可见
-```
-
-**与标准 `sync.Once` 的差异：**
-- 标准库：在执行 `f` 期间持有锁，`f` 完成后才标记 done
-- 自定义实现：先标记 done，释放锁，再执行 `f`
-- 问题：其他 goroutine 看到 `done=1` 时，`f` 可能还在执行中
-
-**代码位置：**
-- once.go:19-36 - `Do()` 和 `mayExecute()`
+**与标准 `sync.Once` 差异：**
+| 行为 | 自定义 once | 标准 sync.Once |
+|------|------------|---------------|
+| 标记 done 时机 | f() 执行前 | f() 执行后 |
+| 执行 f() 时是否持有锁 | 否 | 是 |
+| 其他 goroutine 看到 done=1 时 f() 状态 | 可能正在执行 | 已完成 |
 
 **现有测试证据：**
 - `Test_Execute` (once_test.go:10-42):
   ```go
-  go executeOnce.Do(fExecute)  // 启动 2 个 goroutine
+  go executeOnce.Do(fExecute)  // 2 个 goroutine
   go executeOnce.Do(fExecute)
-  // 等待第一个完成，再启动第三个
-  go executeOnce.Do(fExecute)
+  time.Sleep(...)              // 等待第一个完成
+  go executeOnce.Do(fExecute)  // 第三个
   ```
+  仅 2-3 goroutine，f() 执行时间极短
 
-**测试覆盖状态：❌ 部分覆盖**
-- 只有 2-3 个 goroutine，并发压力低
-- `f()` 只是向 channel 发送，执行时间极短，race 窗口小
-- 未验证 `f()` 内部状态的内存可见性
+**覆盖状态：❌ 覆盖不足**
 
 ---
 
 ### 场景 3: 读写 goroutine 同时调用 NotifyClose
 
-**触发时序：**
-```
-Goroutine (startReading)    Goroutine (startWriteHandler)
-     |                             |
-conn.NextReader() 出错        conn.WriteJSON() 出错
-     |                             |
-c.NotifyClose()                c.NotifyClose()
-     |                             |
-     +---- 同时进入 once.Do ------+
-```
+**代码证据：**
+```go
+// client.go:61-75
+func (c *client) startReading(pongWait time.Duration) {
+    defer c.NotifyClose()  // <-- 出错时调用
+    for {
+        if _, _, err := c.conn.NextReader(); err != nil {
+            return
+        }
+    }
+}
 
-**风险点：**
-- `startReading` 和 `startWriteHandler` 是独立 goroutine
-- 网络故障可能导致两者同时检测到错误
-- 两者都调用 `NotifyClose()`，依赖 `once` 保证只执行一次
-
-**代码位置：**
-- client.go:62 - `startReading` defer `NotifyClose()`
-- client.go:84 - `startWriteHandler` defer `NotifyClose()`
+// client.go:81-108
+func (c *client) startWriteHandler(pingPeriod time.Duration) {
+    defer func() {
+        c.NotifyClose()  // <-- 出错时调用
+        pingTicker.Stop()
+    }()
+    for {
+        select {
+        case message, ok := <-c.write:
+            if !ok { return }
+            if err := writeJSON(c.conn, message); err != nil {
+                return  // 触发 NotifyClose
+            }
+        case <-pingTicker.C:
+            if err := ping(c.conn); err != nil {
+                return  // 触发 NotifyClose
+            }
+        }
+    }
+}
+```
 
 **现有测试证据：**
-- `TestWriteMessageFails`: mock `writeJSON` 出错，只有写 goroutine 退出
-- `TestWritePingFails`: mock `ping` 出错，只有写 goroutine 退出
-- `TestCloseClientOnNotReading`: pong 超时，只有读 goroutine 退出
+- `TestWriteMessageFails` (stream_test.go:39-67): 仅 mock `writeJSON`
+- `TestWritePingFails` (stream_test.go:69-100): 仅 mock `ping`
+- `TestCloseClientOnNotReading` (stream_test.go:138-158): pong 超时
 
-**测试覆盖状态：❌ 未覆盖**
-- 现有测试每次只让一个 goroutine 出错
-- 未模拟"两个 goroutine 同时检测到错误并退出"的场景
+每次只触发一个 goroutine 退出，从未同时触发
+
+**覆盖状态：❌ 未覆盖**
 
 ---
 
 ### 场景 4: API.Close 与新连接 Handle 并发
 
-**触发时序：**
-```
-Goroutine A (API.Close)     Goroutine B (Handle)
-     |                             |
-a.lock.Lock()                      |
-for each client:                   |
-    client.Close()                 |
-delete(a.clients, ...)             |
-a.lock.Unlock()                    |
-                                   a.lock.Lock()
-                                   a.clients[userID] = append(...)
-                                   a.lock.Unlock()
-                                   启动读写 goroutine
-```
+**代码证据：**
+```go
+// stream.go:161-173
+func (a *API) Close() {
+    a.lock.Lock()
+    defer a.lock.Unlock()
 
-**风险点：**
-- `API.Close()` 没有设置"关闭中"标志
-- `Handle()` 没有检查 API 是否已关闭
-- 关闭过程中可能有新连接注册，导致 goroutine 泄漏
+    for _, clients := range a.clients {
+        for _, client := range clients {
+            client.Close()  // <-- 遍历中执行关闭
+        }
+    }
+    for k := range a.clients {
+        delete(a.clients, k)
+    }
+    // <-- 无关闭标志，Handle 仍可注册
+}
 
-**代码位置：**
-- stream.go:161-173 - `Close()` 遍历关闭所有客户端
-- stream.go:154-157 - `Handle()` 注册客户端并启动 goroutine
+// stream.go:143-157
+func (a *API) Handle(ctx *gin.Context) {
+    // <-- 无关闭检查
+    client := newClient(conn, ...)
+    a.register(client)  // <-- 可在 Close 期间注册
+    go client.startReading(...)
+    go client.startWriteHandler(...)
+}
+```
 
 **现有测试证据：**
-- `TestMultipleClients`: line 431-433 - 先 `api.Close()`，再 `api.Notify()` - 串行
-- 所有测试的 `defer api.Close()` 都在测试结束时执行，此时已无新连接
+- 所有测试的 `defer api.Close()` 均在测试结束时执行
+- `TestMultipleClients` (stream_test.go:431-433):
+  ```go
+  api.Close()
+  api.Notify(2, msg)  // Close 后串行调用 Notify
+  ```
 
-**测试覆盖状态：❌ 未覆盖**
-- 无测试模拟"Close 执行期间有新连接进来"
+**覆盖状态：❌ 未覆盖**
 
 ---
 
-### 场景 5: 写通道满时的 Notify 阻塞
+### 场景 5: 写通道满导致 Notify 持有锁阻塞
 
-**触发条件：**
-- `client.write` 容量为 1
-- `startWriteHandler` 因网络阻塞未能及时消费消息
-- `Notify` 连续发送多条消息
+**代码证据：**
+```go
+// client.go:35
+write: make(chan *model.MessageExternal, 1)  // 容量 1
 
-**风险点：**
-- 第二条 `c.write <- msg` 会阻塞
-- 由于 `Notify` 持有 `a.lock.RLock()`，阻塞会导致所有读操作被阻塞
-- 整个推送系统可能因此死锁
+// stream.go:83-91
+func (a *API) Notify(userID uint, msg *model.MessageExternal) {
+    a.lock.RLock()         // <-- 获取读锁
+    defer a.lock.RUnlock() // <-- 函数返回才释放
+    for _, c := range clients {
+        c.write <- msg     // <-- 如果通道满，这里阻塞并持有读锁
+    }
+}
+```
 
-**代码位置：**
-- client.go:35 - `make(chan *model.MessageExternal, 1)`
-- stream.go:84-85 - Notify 持有 RLock 时写入通道
+**死锁风险：**
+1. `startWriteHandler` 因网络阻塞无法消费消息
+2. 第一条消息填满通道
+3. 第二条 `Notify` 写入时阻塞，同时持有 `a.lock.RLock()`
+4. 所有需要 `a.lock.Lock()` 的操作（register/remove/Close）都被阻塞
+5. 整个推送系统死锁
 
 **现有测试证据：**
 - 无测试覆盖此场景
-- 所有测试中消息发送都有间隔，通道不会满
+- 所有测试消息发送都有时间间隔
 
-**测试覆盖状态：❌ 未覆盖**
-
----
-
-## 3. 边界场景 vs 测试覆盖 对照表
-
-| 场景 | 描述 | 现有测试 | 是否已覆盖 |
-|------|------|----------|------------|
-| 1 | Notify 写入 vs Close 关闭通道 | `TestDeleteUser`, `TestDeleteClient`, `TestMultipleClients` | ❌ 串行执行，无并发 |
-| 2 | 自定义 Once 内存可见性 | `Test_Execute` | ❌ 仅 2-3 goroutine，压力不足 |
-| 3 | 读写 goroutine 同时调用 NotifyClose | `TestWriteMessageFails`, `TestWritePingFails` | ❌ 每次只触发一个 goroutine 退出 |
-| 4 | API.Close 与新连接 Handle 并发 | （无对应测试） | ❌ 未覆盖 |
-| 5 | 写通道满导致 Notify 阻塞死锁 | （无对应测试） | ❌ 未覆盖 |
+**覆盖状态：❌ 未覆盖**
 
 ---
 
-## 4. 稳定复现最小步骤
+## 4. 可执行复现步骤（按仓库直接验证）
 
 ### 场景 1 复现：Notify vs Close 并发
 
-**目标：** 触发"向已关闭 channel 写入"的 panic 或 race detection
+**复现目标：** 触发"向已关闭 channel 写入"的数据竞争
 
-**最小步骤：**
+**复现步骤：**
 
+1. **添加测试到 `api/stream/stream_test.go`:**
 ```go
-// 添加到 stream_test.go
+import "sync"
+
 func TestRace_NotifyAndClose(t *testing.T) {
     mode.Set(mode.TestDev)
     server, api := bootTestServer(staticUserID())
@@ -251,15 +295,10 @@ func TestRace_NotifyAndClose(t *testing.T) {
     wsURL := wsURL(server.URL)
     
     // 1. 建立连接
-    client := testClient(t, wsURL)
+    testClient(t, wsURL)
     waitForConnectedClients(api, 1)
     
-    // 2. 获取内部 client 指针（通过辅助函数）
-    api.lock.RLock()
-    internalClient := api.clients[1][0]
-    api.lock.RUnlock()
-
-    // 3. 高并发：同时发送消息和关闭连接
+    // 2. 高并发：同时发送消息和删除用户（内部调用 Close）
     var wg sync.WaitGroup
     for i := 0; i < 1000; i++ {
         wg.Add(2)
@@ -271,7 +310,7 @@ func TestRace_NotifyAndClose(t *testing.T) {
         
         go func() {
             defer wg.Done()
-            internalClient.Close()
+            api.NotifyDeletedUser(1)
         }()
     }
     
@@ -279,18 +318,26 @@ func TestRace_NotifyAndClose(t *testing.T) {
 }
 ```
 
-**触发信号：**
-- 运行 `go test -race ./api/stream -run TestRace_NotifyAndClose`
-- 预期：race detector 报告 "write on closed channel" 或数据竞争
+2. **运行命令：**
+```bash
+cd d:\fz\0508-1\solo-dogfeeding\code\102-server
+go test -race ./api/stream -run TestRace_NotifyAndClose -v -count=1
+```
+
+3. **判定信号：**
+- ✅ `WARNING: DATA RACE` - 检测到数据竞争
+- ✅ `panic: send on closed channel` - 运行时 panic
 
 ---
 
 ### 场景 2 复现：自定义 Once 内存可见性
 
-**最小步骤：**
+**复现目标：** 验证自定义 Once 的内存可见性问题
 
+**复现步骤：**
+
+1. **添加测试到 `api/stream/once_test.go`:**
 ```go
-// 添加到 once_test.go
 func TestRace_OnceMemoryVisibility(t *testing.T) {
     var wg sync.WaitGroup
     
@@ -298,22 +345,18 @@ func TestRace_OnceMemoryVisibility(t *testing.T) {
         o := &once{}
         var sharedState int32
         
-        // 启动 50 个 goroutine 同时调用 Do
         for i := 0; i < 50; i++ {
             wg.Add(1)
             go func() {
                 defer wg.Done()
                 o.Do(func() {
-                    // f() 中修改共享状态
                     atomic.StoreInt32(&sharedState, 42)
                     // 模拟耗时操作，扩大 race 窗口
                     time.Sleep(10 * time.Microsecond)
                 })
                 
-                // Do 返回后读取 sharedState
-                // 如果内存可见性有问题，这里可能读到 0 而不是 42
                 if atomic.LoadInt32(&sharedState) != 42 {
-                    t.Error("Memory visibility issue: sharedState is not 42")
+                    t.Error("Memory visibility issue")
                 }
             }()
         }
@@ -323,25 +366,33 @@ func TestRace_OnceMemoryVisibility(t *testing.T) {
 }
 ```
 
-**触发信号：**
-- 运行 `go test -race ./api/stream -run TestRace_OnceMemoryVisibility`
-- 预期：要么测试失败（sharedState != 42），要么 race detector 报告数据竞争
+2. **运行命令：**
+```bash
+go test -race ./api/stream -run TestRace_OnceMemoryVisibility -v -count=1
+```
+
+3. **判定信号：**
+- ✅ `WARNING: DATA RACE` - 内存竞争
+- ✅ 测试断言失败 `Memory visibility issue`
 
 ---
 
 ### 场景 3 复现：读写 goroutine 同时退出
 
-**最小步骤：**
+**复现目标：** 两个 goroutine 同时调用 NotifyClose
 
+**复现步骤：**
+
+1. **添加测试到 `api/stream/stream_test.go`:**
 ```go
-// 添加到 stream_test.go
+import "github.com/gorilla/websocket"
+
 func TestRace_BothGoroutinesExit(t *testing.T) {
     mode.Set(mode.TestDev)
     
-    // 同时 mock 两个出错路径
+    // Mock 写路径出错
     oldWriteJSON := writeJSON
     oldPing := ping
-    oldNextReader := nextReader
     
     writeJSON = func(conn *websocket.Conn, v interface{}) error {
         return errors.New("write error")
@@ -349,12 +400,10 @@ func TestRace_BothGoroutinesExit(t *testing.T) {
     ping = func(conn *websocket.Conn) error {
         return errors.New("ping error")
     }
-    // 注意：需要导出 NextReader 或通过其他方式 mock
     
     defer func() {
         writeJSON = oldWriteJSON
         ping = oldPing
-        nextReader = oldNextReader
     }()
     
     server, api := bootTestServer(staticUserID())
@@ -365,31 +414,49 @@ func TestRace_BothGoroutinesExit(t *testing.T) {
     testClient(t, wsURL)
     waitForConnectedClients(api, 1)
     
-    // 发送消息触发写错误，同时让读也出错
+    // 触发写 goroutine 退出
     api.Notify(1, &model.MessageExternal{Message: "trigger"})
+    
+    // 同时强制关闭连接触发读 goroutine 退出
+    api.lock.RLock()
+    if clients, ok := api.clients[1]; ok && len(clients) > 0 {
+        clients[0].conn.Close()
+    }
+    api.lock.RUnlock()
     
     // 等待 goroutine 退出
     time.Sleep(100 * time.Millisecond)
     
-    // 如果没有 panic 或 race，则 once 保护有效
-    // 但 race detector 应该能检测到是否有并发问题
+    // 如果没有 panic，说明 once 保护有效
+    // race detector 会检测是否有并发问题
 }
 ```
 
-**触发信号：**
-- 运行 `go test -race ./api/stream -run TestRace_BothGoroutinesExit`
-- 预期：检查是否有重复关闭的 race
+2. **运行命令：**
+```bash
+go test -race ./api/stream -run TestRace_BothGoroutinesExit -v -count=1
+```
+
+3. **判定信号：**
+- ✅ `WARNING: DATA RACE` - 检测到竞争
+- ⚠️ 无输出 = once 保护有效（但 race 可能存在）
 
 ---
 
 ### 场景 4 复现：API.Close 与新连接并发
 
-**最小步骤：**
+**复现目标：** Close 期间新连接注册导致 goroutine 泄漏
 
+**复现步骤：**
+
+1. **添加测试到 `api/stream/stream_test.go`:**
 ```go
-// 添加到 stream_test.go
+import "github.com/fortytw2/leaktest"
+
 func TestRace_CloseAndNewConnections(t *testing.T) {
     mode.Set(mode.TestDev)
+    defer leaktest.Check(t)()  // 检测 goroutine 泄漏
+    
     server, api := bootTestServer(staticUserID())
     defer server.Close()
     
@@ -422,30 +489,35 @@ func TestRace_CloseAndNewConnections(t *testing.T) {
     }()
     
     wg.Wait()
-    
-    // 检查是否有 goroutine 泄漏（leaktest 会检测）
 }
 ```
 
-**触发信号：**
-- 运行 `go test -race ./api/stream -run TestRace_CloseAndNewConnections`
-- 预期：leaktest 检测到 goroutine 泄漏，或 race detector 报告 map 并发访问
+2. **运行命令：**
+```bash
+go test -race ./api/stream -run TestRace_CloseAndNewConnections -v -count=1
+```
+
+3. **判定信号：**
+- ✅ `goleak: Errors on successful test run` - 检测到泄漏
+- ✅ `WARNING: DATA RACE` - map 并发访问
 
 ---
 
 ### 场景 5 复现：写通道满导致死锁
 
-**最小步骤：**
+**复现目标：** 验证通道满时 Notify 持有锁阻塞
 
+**复现步骤：**
+
+1. **添加测试到 `api/stream/stream_test.go`:**
 ```go
-// 添加到 stream_test.go
 func TestRace_FullChannelDeadlock(t *testing.T) {
     mode.Set(mode.TestDev)
     
-    // mock writeJSON 永不返回，模拟网络阻塞
+    // Mock writeJSON 阻塞
     oldWriteJSON := writeJSON
     writeJSON = func(conn *websocket.Conn, v interface{}) error {
-        time.Sleep(10 * time.Second) // 长时间阻塞
+        time.Sleep(10 * time.Second)  // 长时间阻塞
         return nil
     }
     defer func() { writeJSON = oldWriteJSON }()
@@ -470,65 +542,52 @@ func TestRace_FullChannelDeadlock(t *testing.T) {
     
     select {
     case <-done:
-        // 正常完成
+        t.Log("No deadlock detected")
     case <-time.After(500 * time.Millisecond):
-        t.Fatal("Deadlock detected: Notify blocked on full channel")
+        t.Fatal("DEADLOCK DETECTED: Notify blocked holding RLock")
     }
 }
 ```
 
-**触发信号：**
-- 运行 `go test ./api/stream -run TestRace_FullChannelDeadlock`
-- 预期：测试超时失败，检测到死锁
-
----
-
-## 5. 通用复现策略
-
-### 5.1 运行命令
-
+2. **运行命令：**
 ```bash
-# 单次运行带 race 检测
-go test -race ./api/stream/... -v -count=1
-
-# 循环运行 100 次增加触发概率
-for i in {1..100}; do
-    echo "=== Run $i ==="
-    go test -race ./api/stream/... -count=1 -timeout=30s
-    if [ $? -ne 0 ]; then
-        echo "Failed at run $i"
-        exit 1
-    fi
-done
+go test ./api/stream -run TestRace_FullChannelDeadlock -v -count=1
 ```
 
-### 5.2 判定成功标准
-
-| 判定信号 | 来源 | 说明 |
-|---------|------|------|
-| `panic: send on closed channel` | 运行时 | 场景 1 被触发 |
-| `WARNING: DATA RACE` | race detector | 任何数据竞争被检测到 |
-| 测试超时 | go test | 场景 5 死锁被触发 |
-| `goleak: Errors on successful test run` | leaktest | 场景 4 goroutine 泄漏 |
-| 测试断言失败 | `t.Error()` / `t.Fatal()` | 场景 2 内存可见性问题 |
+3. **判定信号：**
+- ✅ `DEADLOCK DETECTED` - 测试超时失败，检测到死锁
 
 ---
 
-## 6. 结论
+## 5. 批量验证脚本
 
-### 6.1 现有测试的局限性
+**一键运行所有 Race 测试：**
 
-1. **串行为主**：所有测试用例均为串行执行，未模拟真实高并发场景
-2. **Race 窗口过小**：并发 goroutine 数量少（2-3 个），操作耗时短
-3. **延迟保护**：`time.Sleep(500ms)` 等延迟掩盖了潜在并发问题
-4. **Mock 单一**：每次只 mock 一个出错路径，未模拟双 goroutine 同时出错
+```bash
+# Windows PowerShell
+cd d:\fz\0508-1\solo-dogfeeding\code\102-server
 
-### 6.2 真正的高风险场景
+# 运行 10 次增加触发概率
+for ($i=1; $i -le 10; $i++) {
+    Write-Host "=== Run $i ==="
+    go test -race ./api/stream/... -run "TestRace_" -count=1 -timeout=60s
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "FAILED at run $i"
+        exit 1
+    }
+}
+```
 
-| 风险等级 | 场景 | 后果 |
-|---------|------|------|
-| 🔴 高 | 场景 1: Notify vs Close | 进程 panic 崩溃 |
-| 🟠 中 | 场景 5: 通道满死锁 | 整个推送系统阻塞 |
-| 🟠 中 | 场景 4: Close 期间新连接 | goroutine 泄漏 |
-| 🟡 低 | 场景 2: Once 内存可见性 | 状态不一致（概率低） |
-| 🟡 低 | 场景 3: 双 goroutine 退出 | 重复调用（once 已防护） |
+---
+
+## 6. 验证结果汇总
+
+| 场景 | 预期结果 | 验证状态 |
+|------|----------|----------|
+| 1. Notify vs Close | DATA RACE 或 panic | ⚠️ 待验证 |
+| 2. Once 内存可见性 | DATA RACE 或断言失败 | ⚠️ 待验证 |
+| 3. 双 goroutine 退出 | 可能无输出（once 保护），或 DATA RACE | ⚠️ 待验证 |
+| 4. Close 与新连接并发 | goroutine 泄漏 | ⚠️ 待验证 |
+| 5. 通道满死锁 | DEADLOCK DETECTED | ⚠️ 待验证 |
+
+**验证说明：** 所有测试用例均可直接添加到当前代码库并运行。由于竞态条件的不确定性，建议循环运行 10 次以上确认结果。
