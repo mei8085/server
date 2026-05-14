@@ -438,7 +438,12 @@ sqldb.SetMaxOpenConns(10)  // SQLite 覆盖为 1
 1. **硬编码限制**: `SetMaxOpenConns(10)` 全局生效，所有数据库方言统一
 2. **SQLite 特殊处理**: 条件分支覆盖为 `SetMaxOpenConns(1)`，防止并发写入问题
 3. **MySQL 生命周期**: `SetConnMaxLifetime(9 * time.Minute)` 确保连接不会永久存活
-4. **无 MaxIdleConns 配置**: 使用 Go 默认值（= MaxOpenConns），意味着空闲连接不会主动释放
+4. **无 MaxIdleConns 配置** → **⚠️ 重要证伪结论**：
+   - ❌ **之前推断错误**：默认值 **不等于** MaxOpenConns
+   - ✅ **标准库事实**：Go `database/sql` 默认 `MaxIdleConns = 2`
+   - 引用来源：[Go 1.23.9 sql 包文档](https://pkg.go.dev/database/sql@go1.23.9)
+   - 实际影响：最多 10 个活跃连接，但只有 2 个空闲连接被保留
+   - 高并发下可能导致连接频繁创建/销毁（连接抖动）
 
 **可验证观测信号**:
 - MySQL: `SHOW PROCESSLIST` 中来自 Gotify 的连接数 ≤ 10
@@ -539,6 +544,34 @@ T3: 新连接创建成功 → 加入连接池，查询执行成功
 
 ---
 
+##### /health 超时边界深度证伪分析
+
+**完整调用链追踪**:
+```
+Gin Handler (api/health.go:35)
+    ↓ 直连调用：a.DB.Ping()
+    ↓ GormDatabase.Ping() (database/ping.go:4-9)
+        ↓ d.DB.DB() → 获取底层 *sql.DB
+        ↓ sqldb.Ping() → 【关键】调用标准库 Ping()（无 context 版本）
+            ↓ sql.DB.Ping() 内部等价于 PingContext(context.Background())
+            ↓ context.Background() 无 Deadline、无 Cancel
+            ↓ 最终超时完全依赖 TCP 协议栈默认超时（分钟级）
+```
+
+**⚠️ 核心结论**：
+- ❌ **不会快速返回 500**
+- ✅ **可能被永久阻塞**（数据库挂起时）
+- ❌ **无任何超时保护**：整个 Ping 链路没有设置任何超时控制
+- **最坏场景**：数据库 TCP 连接 ESTABLISHED 但数据库进程 hang → Ping 不返回 → livenessProbe 超时（默认 10s）触发 Pod 被杀 → 触发不必要的重启风暴
+
+**可验证证据**：
+1. 代码确认：`database/ping.go:9` → `sqldb.Ping()` 而非 `PingContext(ctx)`
+2. 标准库文档：`Ping()` 等价于 `PingContext(context.Background())`
+3. 驱动层面：MySQL 驱动默认无 Ping 超时，由底层 TCP 超时控制
+4. K8s 风险：livenessProbe 超时杀死 Pod 比数据库实际恢复更快
+
+---
+
 #### 5.2.5 数据库查询执行失败
 
 | 项 | 详情 |
@@ -568,22 +601,22 @@ T3: 新连接创建成功 → 加入连接池，查询执行成功
 
 ---
 
-### 6.2 可证伪的恢复决策矩阵
+### 6.2 可证伪的恢复决策矩阵（增强版）
 
-| 失败阶段 | 核心论断 | ✅ 可观测信号（验证） | ❌ 反例条件（证伪） | 推荐动作 |
-|---------|---------|---------------------|-------------------|---------|
-| **配置加载失败** | 配置错误导致 panic，无自动恢复 | 1. stderr 包含 `configor` 错误栈<br>2. 进程退出码 ≠ 0<br>3. `kubectl describe pod` 显示 `BackOff` | 反例：重启后服务正常 → 说明不是配置问题，是临时资源竞争 | 1. 检查 `config.yml` 语法<br>2. 验证 `GOTIFY_*` 环境变量<br>3. 修复后手动重启 |
-| **目录创建失败** | 权限/磁盘问题导致 panic，无自动恢复 | 1. stderr 包含 `mkdir` 或 `permission denied`<br>2. `df -h` 显示磁盘满<br>3. `ls -ld data/` 显示权限不正确 | 反例：同一镜像在其他节点正常 → 说明不是镜像问题，是节点存储问题 | 1. 检查 PVC 挂载状态<br>2. 修复目录权限 UID/GID<br>3. 清理磁盘后重启 |
-| **SQLite 目录创建失败** | SQLite 数据目录无法创建导致 panic | 1. 错误栈包含 `createDirectoryIfSqlite`<br>2. `data/` 目录不存在或不可写 | 反例：MySQL 模式下也报此错 → 代码 bug，不是 SQLite 特有 | 1. 检查 SQLite 文件路径配置<br>2. 验证 volume 挂载为 ReadWriteOnce<br>3. 修复后重启 |
-| **数据库连接建立失败** | DB 不可达导致启动失败，K8s 自动重启可能恢复 | 1. 错误栈包含 `gorm.Open` 或 `dial error`<br>2. `telnet db-host port` 失败<br>3. Pod 重启日志显示同样错误 | 反例：数据库正常但仍报错 → DSN 格式错误/用户名密码错误，重启没用 | 1. 手动验证数据库连接<br>2. 区分是网络问题还是认证问题<br>3. 网络问题：等 K8s 自动重试<br>4. 认证问题：修复 Secret 后手动重启 |
-| **连接池配置失败** | 获取 `*sql.DB` 失败导致 panic | 1. 错误栈包含 `db.DB()`<br>2. 极罕见，通常伴随连接失败同时发生 | 反例：复现失败 → 这是理论上的错误路径，实际很难触发 | 1. 检查 GORM 版本兼容性<br>2. 偶发问题直接重启<br>3. 持续失败需升级依赖 |
-| **AutoMigrate 自动迁移失败** | DDL 执行失败，必须人工介入 | 1. 错误栈包含 `AutoMigrate`<br>2. 数据库日志显示具体失败 SQL<br>3. 重启后报错完全相同 | 反例：重启后迁移成功 → 临时数据库锁，不是结构冲突 | 1. 备份数据库<br>2. 检查失败的 DDL 语句<br>3. 手动迁移后重启服务 |
-| **默认用户创建失败** | 静默失败，服务启动但无 admin 用户 | 1. `SELECT COUNT(*) FROM users` = 0<br>2. `/api/user` 返回空数组<br>3. 无法用默认密码登录 | 反例：能登录但用户不是 admin → 用户创建了但权限不对，不是创建失败 | 1. 首次部署后验证登录<br>2. 手动插入 admin 用户<br>3. 建议：修改代码增加错误检查 |
-| **Sort Key 数据迁移失败** | 事务执行失败导致启动终止 | 1. 错误栈包含 `fillMissingSortKeys`<br>2. `SELECT DISTINCT sort_key FROM applications` 有 NULL | 反例：空库也报错 → 不是数据问题，是事务隔离级别兼容性问题 | 1. 检查 applications 表数据<br>2. 手动清理 NULL sort_key<br>3. 重启服务 |
-| **连接池耗尽** | 并发超过 10 导致请求排队，不终止进程 | 1. `SHOW PROCESSLIST` 显示 Gotify 连接 = 10<br>2. 慢查询日志显示查询耗时突然升高<br>3. P99 延迟上升但错误率不变（排队中） | 反例：连接数 = 10 但延迟正常 → 连接充分利用，不是耗尽 | 1. 优化慢查询（首要）<br>2. 压测验证后考虑增大连接池<br>3. 增加查询级别的 context 超时 |
-| **连接临时中断** | 网络闪断，sql.DB 自动重连恢复 | 1. 短暂出现 HTTP 500 后自动恢复<br>2. 错误信息包含 `bad connection` 或 `invalid connection`<br>3. 数据库端显示连接断开又重建 | 反例：持续 500 不恢复 → 不是临时中断，是网络永久故障 | 1. 无需立即操作，观察 1 分钟<br>2. 持续失败则检查数据库状态<br>3. 必要时手动重启 |
-| **Health Check 失败** | `/health` 返回 500，K8s 触发重启 | 1. `curl /health` 返回 `{health: "orange", database: "red"}`<br>2. `kubectl get pod` 显示 `RESTARTS` 增加<br>3. K8s 事件包含 `Liveness probe failed` | 反例：`/health` 500 但实际查询正常 → Ping() 失败但实际连接池有好连接 | 1. 先验证数据库本身是否正常<br>2. 数据库正常但 health 失败：手动重启<br>3. 数据库异常：先修数据库 |
-| **查询执行失败** | 单请求失败，服务整体存活 | 1. 错误率 < 100%<br>2. 错误日志包含具体 SQL 错误<br>3. `/health` 仍返回 200 green | 反例：100% 请求失败 → 不是单查询问题，是全局故障 | 1. 偶发死锁：忽略，自动重试<br>2. 持续同类错误：代码 bug 需发版修复<br>3. 数据问题：手动修复数据 |
+| 失败阶段 | 核心论断 | ✅ 核验命令 | 📊 观测指标 | ❌ 不成立反例 | 推荐动作 |
+|---------|---------|-----------|-----------|---------------|---------|
+| **配置加载失败** | 配置错误导致 panic，无自动恢复 | `kubectl logs <pod>` | 1. stderr 含 `configor` 错误栈<br>2. 进程退出码 ≠ 0<br>3. CrashLoopBackOff 次数持续增加 | 重启后服务恢复正常 → 不是配置问题，是临时资源竞争 | 1. `cat config.yml` 检查语法<br>2. `env | grep GOTIFY_` 验证环境变量<br>3. 修复后手动重启 |
+| **目录创建失败** | 权限/磁盘问题导致 panic，无自动恢复 | `df -h && ls -ld data/` | 1. stderr 含 `mkdir` / `permission denied`<br>2. 磁盘使用率 100%<br>3. 目录权限 UID/GID 不匹配 | 同一镜像在其他节点正常运行 → 是节点存储问题，不是镜像问题 | 1. 检查 PVC 挂载状态<br>2. `chown -R 1000:1000 data/` 修复权限<br>3. 清理磁盘后重启 |
+| **SQLite 目录创建失败** | SQLite 数据目录无法创建导致 panic | `stat data/gotify.db && ls -ld data/` | 1. 错误栈含 `createDirectoryIfSqlite`<br>2. 父目录不存在或无写入权限<br>3. Pod 重启后问题持续 | MySQL 模式下也报同样错误 → 代码 bug，不是 SQLite 特有 | 1. 检查 `GOTIFY_DATABASE_CONNECTION` 路径<br>2. 验证 volume 是 ReadWriteOnce<br>3. 手动创建目录后重启 |
+| **数据库连接建立失败** | DB 不可达导致启动失败，K8s 自动重启可能恢复 | `mysql -h host -u user -p -e 'SELECT 1'` | 1. 错误栈含 `gorm.Open` 或 `dial error`<br>2. `telnet db-host 3306` 失败<br>3. Pod 重启日志重复同样错误 | 数据库命令行能连上但服务仍报错 → DSN 格式/认证错误，重启无用 | 1. 手动用 `mysql`/`psql` 验证连接<br>2. 区分是网络问题还是认证问题<br>3. 网络问题：等 K8s 自动重试<br>4. 认证问题：修复 Secret 后手动重启 |
+| **连接池配置失败** | 获取 `*sql.DB` 失败导致 panic | 代码级检查，无外部命令 | 1. 错误栈含 `db.DB()`<br>2. 极罕见，通常伴随连接失败同时发生 | 问题无法复现 → 理论错误路径，实际很难触发 | 1. 检查 GORM 版本兼容性<br>2. 偶发问题直接重启<br>3. 持续失败升级依赖 |
+| **AutoMigrate 自动迁移失败** | DDL 执行失败，必须人工介入 | `SHOW PROCESSLIST` 查看执行中 DDL | 1. 错误栈含 `AutoMigrate`<br>2. 数据库日志显示具体失败 SQL<br>3. 重启后报错完全相同 | 重启后迁移自动成功 → 临时数据库锁，不是结构冲突 | 1. `mysqldump` 备份数据库<br>2. 检查失败的 DDL 语句<br>3. 手动执行迁移后重启服务 |
+| **默认用户创建失败** | 静默失败，服务启动但无 admin 用户 | `SELECT COUNT(*) FROM users;` | 1. users 表行数 = 0<br>2. `/api/user` 返回空数组<br>3. 无法用默认密码登录 | 能登录但用户不是 admin → 权限问题，不是创建失败 | 1. 首次部署后验证登录<br>2. 手动 INSERT admin 用户<br>3. ⚠️ 代码缺陷：需增加错误检查 |
+| **Sort Key 数据迁移失败** | 事务执行失败导致启动终止 | `SELECT * FROM applications WHERE sort_key IS NULL;` | 1. 错误栈含 `fillMissingSortKeys`<br>2. sort_key 列存在 NULL 值<br>3. 事务隔离级别冲突 | 空库也报同样错误 → 不是数据问题，是事务隔离级别兼容性 | 1. 检查 applications 表数据<br>2. 手动 UPDATE 清理 NULL sort_key<br>3. 重启服务 |
+| **连接池耗尽 / 连接抖动** | MaxOpenConns=10 + MaxIdleConns=2，高并发下连接抖动 | MySQL: `SHOW STATUS LIKE 'Threads_connected';` | 1. `SHOW PROCESSLIST` 显示 Gotify 连接 = 10<br>2. 慢查询日志 P99 波动<br>3. `SHOW GLOBAL STATUS LIKE 'Aborted_connects'` 持续增加 | 连接数=10 但延迟稳定 → 连接充分利用，不是耗尽 | 1. 优化慢查询（首要）<br>2. **建议**：显式 `SetMaxIdleConns(10)` 匹配 OpenConns<br>3. 压测验证后调整连接池大小 |
+| **连接临时中断** | 网络闪断，sql.DB 自动重连恢复 | `netstat -an | grep ESTABLISHED` 监控连接数 | 1. 短暂出现 HTTP 500 后自动恢复<br>2. 错误含 `bad connection` / `invalid connection`<br>3. 数据库端连接数先降后升 | 持续 500 超过 2 分钟不恢复 → 不是临时中断，是网络永久故障 | 1. 无需立即操作，观察 1 分钟<br>2. 持续失败检查数据库状态<br>3. 必要时手动重启 |
+| **Health Check 阻塞** | `/health` 调用 `sqldb.Ping()` 无超时，可能永久挂起 | `curl -m 5 /health` 设置 5s 超时 | 1. K8s event 显示 `Liveness probe failed: timeout`<br>2. Pod 因 livenessProbe 超时被杀<br>3. `ss -ti` 显示连接 ESTABLISHED 但零窗口 | `curl /health` 500 但实际业务查询正常 → Ping() 失败但连接池有好连接 | 1. **代码修复**：用 `PingContext(ctx)` 带 1s 超时<br>2. K8s 配置：`timeoutSeconds: 5` 缩短健康检查超时<br>3. 数据库异常：先修数据库 |
+| **查询执行失败** | 单请求失败，服务整体存活 | 观察错误率变化 + 检查错误日志 | 1. 错误率 < 100%<br>2. 错误日志含具体 SQL 错误<br>3. `/health` 仍返回 200 green | 100% 请求失败 → 不是单查询问题，是全局故障 | 1. 偶发死锁：忽略，自动重试<br>2. 持续同类错误：代码 bug 需发版<br>3. 数据问题：手动修复数据 |
 
 ---
 
@@ -626,42 +659,96 @@ T3: 新连接创建成功 → 加入连接池，查询执行成功
 
 ---
 
-### 6.4 关键发现与改进建议
+### 6.4 代码改进建议汇总
 
-#### 🔴 风险点 1: 默认用户创建静默失败
+#### 🔴 改进 1: 健康检查增加超时保护
+
+**当前问题代码** (`database/ping.go:4-9`):
 ```go
-// database/database.go:87-91
+func (d *GormDatabase) Ping() error {
+    sqldb, err := d.DB.DB()
+    if err != nil {
+        return err
+    }
+    return sqldb.Ping()  // ❌ 无超时，使用 context.Background()
+}
+```
+
+**建议修复**:
+```go
+func (d *GormDatabase) Ping() error {
+    sqldb, err := d.DB.DB()
+    if err != nil {
+        return err
+    }
+    ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+    defer cancel()
+    return sqldb.PingContext(ctx)  // ✅ 1s 超时保护
+}
+```
+
+---
+
+#### 🔴 改进 2: 显式配置 MaxIdleConns
+
+**当前问题代码** (`database/database.go:58-81`):
+```go
+sqldb.SetMaxOpenConns(10)
+// ❌ 缺少 SetMaxIdleConns，使用默认值 2
+// 导致：10 个活跃连接但只有 2 个被保留，高并发下连接频繁销毁重建
+```
+
+**建议修复**:
+```go
+sqldb.SetMaxOpenConns(10)
+sqldb.SetMaxIdleConns(10)  // ✅ 与 MaxOpenConns 对齐
+sqldb.SetConnMaxIdleTime(1 * time.Minute)  // ✅ 空闲连接回收
+```
+
+**预期收益**:
+- 减少连接创建/销毁开销
+- 降低数据库 `Aborted_connects` 计数
+- 提升高并发下查询稳定性
+
+---
+
+#### 🔴 改进 3: 默认用户创建增加错误检查
+
+**当前问题代码** (`database/database.go:87-91`):
+```go
 userCount := int64(0)
 db.Find(new(model.User)).Count(&userCount)  // ❌ 错误未检查
 if createDefaultUserIfNotExist && userCount == 0 {
     db.Create(&model.User{...})  // ❌ 错误未检查
 }
 ```
-**问题**: 这两步的错误都被忽略了，如果数据库此时异常，服务能正常启动但没有管理员用户，导致无法登录。
 
-**建议**: 添加错误检查和日志输出。
-
----
-
-#### 🔴 风险点 2: 启动阶段无重试机制
-所有启动失败都直接 panic 终止，没有重试逻辑。在 K8s 环境中，数据库可能比 Gotify 启动慢，导致 Gotify 反复 CrashBackOff。
-
-**建议**: 添加数据库连接重试逻辑，支持指数退避。
+**建议修复**: 增加 `if err != nil` 检查并输出错误日志。
 
 ---
 
-#### 🟡 优化点 1: 健康检查粒度不够
-当前 `/health` 只做 Ping()，无法区分：
+#### 🔴 改进 4: 启动阶段数据库连接增加重试机制
+
+**问题描述**: 所有启动失败都直接 panic 终止，没有重试逻辑。在 K8s 环境中，数据库可能比 Gotify 启动慢，导致 Gotify 反复 CrashBackOff。
+
+**建议**: 添加数据库连接重试逻辑，支持指数退避，最多重试 5 次。
+
+---
+
+#### 🟡 优化点 5: 健康检查粒度增强
+
+**当前问题**: `/health` 只做 Ping()，无法区分：
 - 数据库完全不可用
 - 部分连接失效
 - 性能问题（慢查询）
 
-**建议**: 扩展健康检查，增加连接池状态指标。
+**建议**: 扩展健康检查，增加连接池状态指标（空闲连接数、活跃连接数等）。
 
 ---
 
-#### 🟡 优化点 2: 缺少数据库监控指标
-当前没有暴露连接池使用率、等待队列长度等指标。
+#### 🟡 优化点 6: 增加数据库监控指标
+
+**当前问题**: 没有暴露连接池使用率、等待队列长度等指标。
 
 **建议**: 集成 Prometheus metrics 暴露数据库相关指标。
 
@@ -705,6 +792,7 @@ livenessProbe:
     port: 80
   initialDelaySeconds: 10
   periodSeconds: 10
+  timeoutSeconds: 5  # ✅ 建议缩短超时，配合代码层面的 PingContext
 
 readinessProbe:
   httpGet:
@@ -714,17 +802,20 @@ readinessProbe:
   periodSeconds: 5
 ```
 
+**启动策略**: 建议添加 `initContainer` 等待数据库就绪，避免不必要的 CrashBackOff。
+
 ### 8.2 数据库高可用
 
 1. **MySQL/PostgreSQL**: 使用主从复制或集群部署
 2. **SQLite**: 仅适合单实例部署，不适合高可用场景
-3. **连接池**: 当前配置为 10 个连接，根据负载调整
+3. **连接池**: 当前配置为 10 个连接，根据负载调整，同时配置 MaxIdleConns 匹配
 
 ### 8.3 监控告警
 
 - 监控 `/health` 端点返回状态
 - 告警阈值：连续 3 次返回非 green 状态
 - 关注数据库连接错误日志
+- 额外监控：连接池使用率、`Aborted_connects` 增长率
 
 ---
 
@@ -751,7 +842,13 @@ readinessProbe:
 2. **无重试机制**: 启动时失败直接终止，不进行重试
 3. **幂等设计**: 初始化流程可安全重复执行
 
-### 10.2 恢复策略总览
+### 10.2 关键证伪发现
+
+1. **MaxIdleConns 默认值**: Go `database/sql` 默认 `MaxIdleConns = 2`，**不等于** `MaxOpenConns`，可能导致连接抖动
+2. **/health 无超时保护**: `Ping()` 使用 `context.Background()`，数据库挂起时可能永久阻塞，触发 K8s livenessProbe 超时重启
+3. **运行时重连不经过 GORM**: 运行时连接管理完全由 `database/sql` 负责，`gorm.Open` 仅在启动时调用一次
+
+### 10.3 恢复策略总览
 
 | 失败阶段 | 恢复方式 | 自动化程度 |
 |---------|---------|-----------|
@@ -761,8 +858,9 @@ readinessProbe:
 | 自动迁移 | 修复数据库结构后重启 | 手动 |
 | 运行时中断 | 健康检查失败后重启 | 自动（K8s） |
 
-### 10.3 设计考量
+### 10.4 设计考量
 
 - 简单可靠：失败即终止，避免不一致状态
 - 幂等安全：重复初始化不会破坏数据
 - 运维友好：通过健康检查端点支持容器编排
+- 需优化点：连接池配置、超时控制、错误日志完整性
