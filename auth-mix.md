@@ -18,7 +18,7 @@
 | 3 | Header `Authorization` | Bearer 认证 | `Authorization: Bearer xxxxxx` |
 | 4 | Cookie | Cookie `gotify-client-token` | 浏览器自动携带 |
 
-**重要**：只要找到一个有效的 Token 源，就会使用该值，后续来源不再检查。
+**重要规则：先命中先使用，命中后即使无效也不回退**。即只要某一优先级来源存在值（即使为空或无效），就会锁定该来源进行验证，不会尝试从更低优先级来源提取 Token。
 
 ## 3. 认证方法组合与优先级
 
@@ -82,9 +82,79 @@
 
 **行为**：无论认证成功与否，都继续请求。认证成功时，注册用户/客户端信息到上下文。
 
-## 4. 典型场景分析
+## 4. 组合判定矩阵
 
-### 场景 1：请求同时包含 Cookie 和 Header Token
+以下矩阵覆盖 cookie、query、header、basic 同时出现时的组合判定场景，以 RequireClient 中间件为例。
+
+**符号说明**：
+- ✓：有效凭据
+- ✗：无效凭据
+- -：未提供凭据
+- (Q)：Query 参数
+- (H)：Header `X-Gotify-Key`
+- (A)：Header `Authorization: Bearer`
+- (C)：Cookie
+- (B)：Basic Auth
+
+### 4.1 RequireClient 组合矩阵
+
+| 序号 | Basic (B) | Query (Q) | Header (H) | Auth (A) | Cookie (C) | 实际使用 | 结果 | 说明 |
+|------|-----------|-----------|------------|----------|------------|----------|------|------|
+| 1 | - | ✓ | ✓ | ✓ | ✓ | B 无 → Q | 200 | Q 有效，直接使用 |
+| 2 | - | ✗ | ✓ | ✓ | ✓ | Q | 401 | Q 无效，不回退到 H/A/C |
+| 3 | - | - | ✓ | ✓ | ✓ | H | 200 | H 有效 |
+| 4 | - | - | ✗ | ✓ | ✓ | H | 401 | H 无效，不回退到 A/C |
+| 5 | - | - | - | ✓ | ✓ | A | 200 | A 有效 |
+| 6 | - | - | - | ✗ | ✓ | A | 401 | A 无效，不回退到 C |
+| 7 | - | - | - | - | ✓ | C | 200 | C 有效 |
+| 8 | - | - | - | - | ✗ | C | 401 | C 无效 |
+| 9 | ✓ | ✓ | ✓ | ✓ | ✓ | B | 200 | Basic Auth 优先级最高，Token 全部忽略 |
+| 10 | ✗ | ✓ | ✓ | ✓ | ✓ | B 失败 → Q | 200 | B 无效，回退到 Token 验证，使用 Q |
+| 11 | ✗ | ✗ | ✓ | ✓ | ✓ | B 失败 → Q | 401 | B 无效，Q 也无效，不继续回退 |
+| 12 | - | ✓ | - | - | ✓ | Q | 200 | Q 优先于 C |
+| 13 | - | ✗ | - | - | ✓ | Q | 401 | Q 无效，不回退到 C |
+| 14 | ✓ | ✗ | ✗ | ✗ | ✗ | B | 200 | B 有效，Token 无效不影响 |
+| 15 | ✗ | ✗ | ✗ | ✗ | ✗ | B 失败 → Q | 401 | 全部无效 |
+
+### 4.2 RequireApplicationToken 组合矩阵（401 vs 403 差异）
+
+| 序号 | Basic (B) | Query (Q) | 实际使用 | 结果 | 说明 |
+|------|-----------|-----------|----------|------|------|
+| 1 | - | ✓ (App) | Q | 200 | App Token 有效 |
+| 2 | - | ✓ (Client) | Q | 401 | Client Token 不是 App Token |
+| 3 | ✓ (用户) | - | Q 无 → B 检查 | 403 | 有效用户认证，但不允许访问应用端点 |
+| 4 | ✗ | - | Q 无 → B 检查 | 401 | 无效用户认证 |
+| 5 | ✓ (用户) | ✗ | Q → B 检查 | 401 | Q 无效，B 有效但类型错误，返回 401（注意：先验证 Token，失败后才检查 Basic） |
+
+**关键差异**：在 RequireApplicationToken 中，Basic Auth 仅用于区分失败原因，不是主要认证方式。
+
+### 4.3 RequireAdmin 组合矩阵（403 场景）
+
+| 序号 | Basic (B) | Query (Q) | 实际使用 | 结果 | 说明 |
+|------|-----------|-----------|----------|------|------|
+| 1 | ✓ (管理员) | ✓ | B | 200 | 管理员认证成功 |
+| 2 | ✓ (普通用户) | ✓ | B | 403 | 认证成功但无权限 |
+| 3 | - | ✓ (普通用户) | Q | 403 | Token 有效但用户非管理员 |
+| 4 | - | ✓ (管理员但未提升) | Q | 403 | session not elevated |
+| 5 | - | ✗ (管理员) | Q | 401 | Token 无效 |
+
+## 5. 典型场景分析
+
+### 场景 1：高优先级无效，低优先级有效
+
+**请求**：
+```
+GET /message?token=InvalidToken
+Cookie: gotify-client-token=ValidClientToken
+```
+
+**结果**：
+- Query 参数优先命中 `InvalidToken`
+- 验证失败
+- **不回退**到 Cookie
+- 返回 401
+
+### 场景 2：请求同时包含 Cookie 和 Header Token
 
 **请求**：
 ```
@@ -96,7 +166,7 @@ X-Gotify-Key: HeaderToken456
 - 优先使用 `X-Gotify-Key` 中的 `HeaderToken456`
 - Cookie 中的 Token 被忽略
 
-### 场景 2：请求同时包含 Basic Auth 和 Client Token
+### 场景 3：请求同时包含 Basic Auth 和 Client Token
 
 **请求**：
 ```
@@ -109,7 +179,7 @@ X-Gotify-Key: ClientToken123
 - 如果用户凭据有效 → 使用用户身份，Token 被忽略
 - 如果用户凭据无效 → 回退到 Token 验证
 
-### 场景 3：Cookie 中的 Token 是 Application Token
+### 场景 4：Cookie 中的 Token 是 Application Token
 
 **请求**：
 ```
@@ -123,7 +193,7 @@ Cookie: gotify-client-token=AppToken_A123
 - 验证为有效 Application Token
 - 认证成功
 
-### 场景 4：Cookie 中的 Token 是 Client Token，访问应用端点
+### 场景 5：Cookie 中的 Token 是 Client Token，访问应用端点
 
 **请求**：
 ```
@@ -138,19 +208,47 @@ Cookie: gotify-client-token=ClientToken_C123
 - 检查是否有 Basic Auth → 无
 - 返回 401
 
-### 场景 5：同时提供 Query Token 和 Cookie Token
+### 场景 6：同时提供 Query Token 和 Cookie Token，Query 无效
 
 **请求**：
 ```
-GET /message?token=QueryToken123
-Cookie: gotify-client-token=CookieToken456
+GET /message?token=InvalidQueryToken
+Cookie: gotify-client-token=ValidCookieToken
 ```
 
 **结果**：
-- 优先使用 Query 参数中的 `QueryToken123`
-- Cookie 中的 Token 被忽略
+- 优先使用 Query 参数中的 `InvalidQueryToken`
+- 验证失败
+- **不回退**到 Cookie 中的有效 Token
+- 返回 401
 
-## 5. Token 类型区分
+### 场景 7：有效 Basic Auth + 无效 Token
+
+**请求**：
+```
+Authorization: Basic valid-user-credentials
+X-Gotify-Key: InvalidToken
+```
+
+**结果**（RequireClient 端点）：
+- Basic Auth 验证成功
+- Token 被完全忽略
+- 返回 200
+
+### 场景 8：无效 Basic Auth + 有效 Token
+
+**请求**：
+```
+Authorization: Basic invalid-credentials
+X-Gotify-Key: ValidClientToken
+```
+
+**结果**（RequireClient 端点）：
+- Basic Auth 验证失败
+- 回退到 Token 验证
+- Token 有效 → 返回 200
+
+## 6. Token 类型区分
 
 系统中有三种 Token 类型，通过前缀区分（`auth/token.go:11-13`）：
 - **Application Token**：`A` 前缀
@@ -159,7 +257,7 @@ Cookie: gotify-client-token=CookieToken456
 
 **注意**：Cookie 中可以存储任意类型的 Token，系统会根据 Token 内容自动识别类型。
 
-## 6. Cookie 刷新机制
+## 7. Cookie 刷新机制
 
 当 Token 通过 Cookie 传递且验证成功时，系统会自动刷新 Cookie：
 
@@ -167,32 +265,43 @@ Cookie: gotify-client-token=CookieToken456
 - 有效期：7 天（`CookieMaxAge = 7 * 24 * 60 * 60`）
 - Cookie 属性：`HttpOnly=true`、`SameSite=Strict`、`Secure`（根据配置）
 
-## 7. 认证状态流转
+## 8. 认证状态流转
 
 ```
 请求到达
     ↓
+┌─────────────────────────────────────────┐
+│  检查 Basic Auth                         │
+└─────────────────────────────────────────┘
+    ↓
+    ├─────────────成功─────────────┐
+    ↓                               ↓
+┌─────────────┐              ┌─────────────────┐
+│  验证权限？  │              │  注册用户到上下文  │
+└─────────────┘              └─────────────────┘
+    ↓ 失败/未提供                     ↓
 ┌─────────────────────────────────┐
 │  按优先级提取 Token              │
 │  Query → Header → Auth → Cookie │
+│  先命中先使用，不回退           │
 └─────────────────────────────────┘
     ↓
-    ├─────────────────────────────────────────┐
-    ↓                                         ↓
-┌─────────────┐     成功     ┌─────────────────────────┐
-│ Basic Auth? │ ───────────> │ 注册用户到上下文         │
-└─────────────┘              └─────────────────────────┘
-    ↓ 失败/未提供                          ↓
-┌─────────────┐     成功     ┌─────────────────────────┐
-│ Token 验证? │ ───────────> │ 注册客户端/应用到上下文  │
-└─────────────┘              └─────────────────────────┘
+┌─────────────┐
+│ 验证 Token? │
+└─────────────┘
+    ↓
+    ├───────────成功───────────┐
+    ↓                           ↓
+┌─────────────┐          ┌─────────────────────┐
+│ 检查权限？   │          │ 注册客户端/应用到上下文 │
+└─────────────┘          └─────────────────────┘
     ↓ 失败
 ┌─────────────┐
-│ 返回 401    │
+│ 返回 401/403│
 └─────────────┘
 ```
 
-## 8. 关键代码位置
+## 9. 关键代码位置
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
