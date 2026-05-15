@@ -754,7 +754,249 @@ if createDefaultUserIfNotExist && userCount == 0 {
 
 ---
 
-## 七、配置参数说明
+## 七、运维核验手册（可直接执行）
+
+### 7.1 核验范围与前置条件
+
+| 核验项 | 前置条件 |
+|--------|---------|
+| **MaxIdleConns 连接抖动** | 1. 服务已启动并处于正常流量状态<br>2. 有数据库服务器访问权限<br>3. 有 SHOW PROCESSLIST 权限 |
+| **/health 阻塞边界** | 1. 服务已启动<br>2. 有 curl 或 http 客户端访问权限<br>3. 有 K8s Pod 访问权限（如部署在 K8s） |
+
+---
+
+### 7.2 MaxIdleConns 连接抖动核验手册
+
+#### 核验步骤 1：确认当前连接状态
+
+**命令**（MySQL 环境）：
+```bash
+# 方式1：直接查询数据库进程列表
+mysql -h <DB_HOST> -u <USER> -p<PASS> -e "SHOW PROCESSLIST;" | grep "Gotify\|gotify"
+
+# 方式2：查询连接状态统计
+mysql -h <DB_HOST> -u <USER> -p<PASS> -e "SHOW GLOBAL STATUS LIKE 'Aborted_connects';"
+mysql -h <DB_HOST> -u <USER> -p<PASS> -e "SHOW GLOBAL STATUS LIKE 'Threads_connected';"
+```
+
+**预期观测**：
+| 指标 | 正常值 | 异常值 |
+|------|--------|--------|
+| Gotify 连接数 | 稳定在 2-10 之间 | 频繁波动（1→10→1→10） |
+| Aborted_connects 增长率 | 每小时增加 < 10 | 每分钟增加 > 5 |
+| Threads_connected | 与连接池配置匹配 | 持续剧烈波动 |
+
+---
+
+#### 核验步骤 2：压测验证连接抖动
+
+**命令**：
+```bash
+# 开 3 个终端并行执行以下命令，持续 2 分钟
+for i in {1..100}; do curl -s http://<GOTIFY_HOST>/health > /dev/null; sleep 0.1; done
+
+# 同时在另一个终端监控数据库连接数（每秒采样）
+while true; do mysql -h <DB_HOST> -u <USER> -p<PASS> -e "SHOW PROCESSLIST;" | grep -c "Gotify\|gotify"; sleep 1; done
+```
+
+**预期观测**（抖动现象）：
+```
+2
+2
+10
+10
+2
+2
+10
+... 反复跳变
+```
+
+---
+
+#### 核验步骤 3：偏差解读与反例分流
+
+| 观测结果 | 问题诊断 | 反例排除 |
+|---------|---------|---------|
+| **连接数在 2-10 间剧烈跳变** | ✅ **确认存在连接抖动**<br>原因：MaxIdleConns(2) << MaxOpenConns(10) | ❌ 反例：刚好有请求高峰结束，连接正常回落<br>判定：波动持续超过 5 分钟且与流量无关 |
+| **Aborted_connects 快速增长** | ✅ **连接频繁销毁重建**<br>原因：空闲连接超过 2 个即被关闭 | ❌ 反例：数据库重启导致批量中断<br>判定：对比 `Aborted_clients` 指标同步增长 |
+| **连接数稳定在 10** | ⚠️ **持续高并发，连接池满**<br>不是抖动问题，是连接池大小不足 | ❌ 反例：刚启动服务连接数逐步上升<br>判定：稳定超过 5 分钟且 P99 延迟正常 |
+| **连接数稳定在 2** | ⚠️ **低负载下的正常状态**<br>无需优化 | ❌ 反例：没有流量时的稳定状态<br>判定：QPS < 5 时为正常 |
+
+---
+
+#### 核验步骤 4：验证修复效果（配置 MaxIdleConns=10 后）
+
+**修复操作**（代码修改）：
+```go
+// database/database.go 添加
+sqldb.SetMaxIdleConns(10)           // 与 MaxOpenConns 对齐
+sqldb.SetConnMaxIdleTime(1 * time.Minute)  // 空闲 1 分钟后回收
+```
+
+**验证命令**：
+```bash
+# 重启服务后，再次执行压测，观察连接数
+while true; do mysql -h <DB_HOST> -u <USER> -p<PASS> -e "SHOW PROCESSLIST;" | grep -c "Gotify\|gotify"; sleep 1; done
+```
+
+**预期修复效果**：
+```
+10
+10
+10
+10
+10
+... 稳定在 10 不再跳变
+```
+
+---
+
+### 7.3 /health 阻塞边界核验手册
+
+#### 核验步骤 1：确认当前健康检查配置
+
+**命令 1**：检查 Go 代码中的 Ping 实现：
+```bash
+grep -n "PingContext\|Ping()" database/ping.go
+# 预期：只有 Ping()，没有 PingContext
+```
+
+**命令 2**：K8s 环境检查 livenessProbe 超时：
+```bash
+kubectl describe pod <POD_NAME> | grep -A5 livenessProbe
+```
+
+**预期观测**：
+| 配置项 | 预期值 | 风险值 |
+|--------|--------|--------|
+| 代码实现 | `sqldb.Ping()` | ❌ **高风险**：无超时保护 |
+| K8s timeoutSeconds | 5s（建议） | ≥ 10s |
+| K8s initialDelaySeconds | 10s | < 5s |
+
+---
+
+#### 核验步骤 2：验证超时边界（模拟数据库挂起）
+
+**⚠️ 注意：仅在测试环境执行**
+
+**命令**（制造阻塞场景）：
+```bash
+# 方式1：iptables 丢包（需要 root）
+sudo iptables -A OUTPUT -p tcp --dport 3306 -j DROP
+
+# 方式2：用 tc 模拟网络延迟（更温和）
+sudo tc qdisc add dev eth0 root netem delay 30000ms  # 30秒延迟
+
+# 方式3：curl 超时测试（生产环境也能执行）
+curl -m 15 http://<GOTIFY_HOST>/health  # 15秒超时
+echo "Exit code: $?"  # 0=成功, 28=超时
+```
+
+**预期观测**：
+```
+# ❌ 阻塞现象：curl 卡住超过 10 秒，无响应
+# 最终 K8s 会因为 livenessProbe 超时杀死 Pod
+```
+
+---
+
+#### 核验步骤 3：偏差解读与反例分流
+
+| 观测结果 | 问题诊断 | 反例排除 |
+|---------|---------|---------|
+| **curl -m 15 /health 超时退出** | ✅ **确认存在阻塞风险**<br>原因：Ping() 使用 context.Background() | ❌ 反例：服务本身完全崩溃无响应<br>判定：其他接口也无响应则不是 Ping 问题 |
+| **curl -m 15 /health 5 秒内返回 500** | ✅ **数据库不可达但快速失败**<br>不是阻塞问题，是真正的连接失败 | ❌ 反例：数据库挂起但 TCP 连接还在<br>判定：有错误信息返回就是正常失败路径 |
+| **curl -m 15 /health 1 秒内返回 200** | ⚠️ **当前状态正常**<br>但不代表挂起时不会阻塞 | ❌ 反例：健康检查成功代表一切正常<br>判定：正常只是当前状态，不代表边界安全 |
+| **Pod 频繁重启但无错误日志** | ✅ **疑似 livenessProbe 超时被杀**<br>原因：Ping 阻塞超过 probe 超时 | ❌ 反例：OOMKilled 被系统杀死<br>判定：检查 `kubectl describe pod` 中的 Restart Reason |
+
+---
+
+#### 核验步骤 4：验证修复效果（使用 PingContext 后）
+
+**修复操作**（代码修改）：
+```go
+// database/ping.go
+func (d *GormDatabase) Ping() error {
+    sqldb, err := d.DB.DB()
+    if err != nil {
+        return err
+    }
+    ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+    defer cancel()
+    return sqldb.PingContext(ctx)  // ✅ 带超时的 Ping
+}
+```
+
+**验证命令**：
+```bash
+# 重启服务后，再次模拟网络延迟
+sudo tc qdisc add dev eth0 root netem delay 30000ms
+
+# 验证 1 秒内快速失败
+time curl -v http://<GOTIFY_HOST>/health
+# 预期：1 秒左右返回错误，不会阻塞到 10 秒
+```
+
+---
+
+### 7.4 排障时序表（先看什么再做什么）
+
+#### 值班人员标准操作流程（SOP）
+
+| 步骤 | 操作 | 命令 / 动作 | 决策分支 |
+|------|------|------------|---------|
+| **0 分钟** | 告警触发，第一件事 | **先看告警内容** | 🔴 P1：服务完全不可用 → 跳 **紧急路径**<br>🟡 P2：健康检查偶发失败 → 走**标准路径** |
+| **0.5 分钟** | **紧急路径**：先恢复服务 | `kubectl rollout restart deployment/<DEPLOY_NAME>` | 重启后恢复 → 事后根因分析<br>重启后依旧异常 → 继续 |
+| **1 分钟** | **标准路径第一步**：验证当前状态 | `curl -m 5 http://<SERVICE_IP>/health` | 200 green ✅ → 自动恢复，确认即可<br>500 red/orange → 数据库问题<br>超时无响应 → 阻塞问题 |
+| **2 分钟** | **第二步**：看 Pod 状态 | `kubectl get pods` | Running 但重启次数增加 → livenessProbe 超时<br>CrashLoopBackOff → 启动阶段失败 |
+| **3 分钟** | **第三步**：查看最近退出原因 | `kubectl describe pod <POD_NAME> | grep -A3 "Last State"` | Reason: Error → panic 了，看日志<br>Reason: Completed → 正常<br>没有 Reason → 被 livenessProbe 杀了 |
+| **4 分钟** | **第四步**：看应用日志（关键） | `kubectl logs --previous <POD_NAME>` 或<br>`kubectl logs <POD_NAME> --tail 200` | 有 panic 堆栈 → 启动阶段问题<br>日志突然截断无错误 → 被探针杀死（阻塞问题）<br>有数据库连接错误 → 数据库问题 |
+| **5 分钟** | **第五步**：验证数据库连通性 | `mysql -h <DB_HOST> -u <USER> -p<PASS> -e "SELECT 1"` 或<br>`kubectl exec -it <POD_NAME> -- curl -m 5 mysql:3306` | 数据库正常但服务异常 → 代码/连接池问题<br>数据库也异常 → 先修数据库 |
+| **5-10 分钟** | **第六步**：确认连接池状态 | `mysql -h <DB_HOST> -u <USER> -p<PASS> -e "SHOW PROCESSLIST;" | wc -l` 或<br>观察连接数波动 | 连接数剧烈波动 → MaxIdleConns 抖动问题<br>连接数=0 → 连接建立失败<br>连接数=10 且稳定 → 正常 |
+| **10 分钟+** | **第七步**：根因定位 | 对照本报告 **6.2 决策矩阵** | 匹配对应场景，执行推荐动作 |
+
+---
+
+#### ⚠️ 值班人员避坑指南
+
+| 常见误操作 | 为什么错 | 正确做法 |
+|-----------|---------|---------|
+| **第一时间就重启** | 销毁现场，无法定位根因 | 👉 先执行 curl 和 kubectl get pods 收集基础信息再重启 |
+| **盲目调大连接池** | 只改 MaxOpenConns 没改 MaxIdleConns，问题依旧 | 👉 两个参数一起改成相同值：10 |
+| **只看有没有错误日志** | 阻塞被杀没有错误日志，只有突然截断 | 👉 看 Pod 的 Restart Reason 和 Events |
+| **修复后不验证** | 改了代码以为好了但没验证边界 | 👉 用 `curl -m <超时>` 强制验证失败路径 |
+| **把 livenessProbe 超时改长** | 治标不治本，服务还是阻塞的 | 👉 根源是代码 Ping 无超时，应该修复代码 |
+
+---
+
+#### 🔴 紧急情况快速判断树
+
+```
+接到告警
+    │
+    ├─ 用户反馈服务不可用？
+    │   ├─ 是 → 立即执行滚动重启
+    │   │   └─ 重启后恢复 → 事后做根因分析
+    │   └─ 否 → 继续排查
+    │
+    ├─ Pod 重启次数在增加？
+    │   ├─ 是 → 被 livenessProbe 杀死（阻塞问题可能性大）
+    │   │   └─ 检查：kubectl describe pod Events 部分
+    │   └─ 否 → 只是个别请求失败，不是全局问题
+    │
+    ├─ curl /health 超过 5 秒没响应？
+    │   ├─ 是 → 阻塞问题，数据库 hang 住了
+    │   │   └─ 紧急：重启服务 + 检查数据库状态
+    │   └─ 否 → 正常返回，检查其他接口
+    │
+    └─ 数据库 SHOW PROCESSLIST 连接数跳变？
+        ├─ 是 → MaxIdleConns 抖动，不紧急但需优化
+        └─ 否 → 正常
+```
+
+---
+
+## 八、配置参数说明
 
 **文件位置**: `config/config.go:47-54`
 
