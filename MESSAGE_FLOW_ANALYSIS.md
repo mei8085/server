@@ -342,6 +342,68 @@ public refreshByApp = async (appId: number) => {
 </Button>
 ```
 
+### 7.4 未读维度刷新
+
+**当前实现状态**：**未实现**
+
+**代码证据**：
+
+1. **服务端模型缺失** (`model/message.go`)：
+```go
+type Message struct {
+    ID            uint
+    ApplicationID uint
+    Message       string
+    Title         string
+    Priority      int
+    Extras        []byte
+    Date          time.Time
+    // 缺失：IsRead bool
+    // 缺失：ReadAt time.Time
+}
+```
+
+2. **前端类型缺失** (`ui/src/types.ts`)：
+```typescript
+interface IMessage {
+    id: number;
+    appid: number;
+    message: string;
+    title: string;
+    priority: number;
+    date: string;
+    image?: string;
+    extras?: IMessageExtras;
+    // 缺失：isRead?: boolean;
+}
+```
+
+3. **MessagesStore无未读状态管理** (`ui/src/message/MessagesStore.ts`)：
+```typescript
+interface MessagesState {
+    messages: IObservableArray<IMessage>;
+    hasMore: boolean;
+    nextSince: number;
+    loaded: boolean;
+    // 缺失：unreadCount: number;
+}
+```
+
+**功能缺口分析**：
+
+| 维度 | 缺口描述 | 影响 |
+|------|----------|------|
+| **数据模型** | 缺少 `isRead` / `readAt` 字段 | 无法追踪消息阅读状态 |
+| **状态管理** | 缺少未读计数统计 | 无法展示未读消息数量 |
+| **API支持** | 缺少按未读筛选接口 | 无法实现未读消息过滤 |
+| **UI交互** | 缺少标记已读功能 | 用户无法清除未读状态 |
+
+**业务影响**：
+- 用户无法快速定位未读消息
+- 无法实现"未读消息数量"徽章提示
+- 无法支持"只看未读"筛选模式
+- 多端登录时无法同步已读状态
+
 ---
 
 ## 8. 代码优化建议
