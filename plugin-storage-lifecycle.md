@@ -123,14 +123,14 @@ type PluginConf struct {
              │
              ▼
     ┌──────────────────┐
-    │  用户删除/清理   │
+    │  内存实例回收    │
     │  (RemoveUser)    │
     └────────┬────────┘
              │
              ▼
     ┌──────────────────┐
     │  数据库记录删除  │
-    │  (级联删除)      │
+    │ (DeleteUserByID) │
     └──────────────────┘
 ```
 
@@ -154,7 +154,7 @@ type PluginConf struct {
 #### 路径 B: 启用状态判断（独立路径二）
 
 - **位置**: `plugin/manager.go:353-362`
-- **触发时机**: 实例创建后，与存储能力检测并行执行
+- **触发时机**: 实例创建后，与存储能力检测顺序执行（非并行）
 - **关键操作**:
   ```go
   if pluginConf.Enabled {
@@ -244,21 +244,29 @@ type PluginConf struct {
   - 更新数据库中 `PluginConf.Enabled = false`
   - **Storage Handler 仍保留在实例中**，下次启用后可直接使用
 
-#### 状态 7: 实例回收 (`RemoveUser`)
+#### 状态 7: 内存实例回收 (`RemoveUser`)
 
-- **位置**: `plugin/manager.go:184-208`
-- **触发时机**: 用户被删除时
-- **对存储的影响**: 仅删除内存实例，数据库中的 Storage 数据仍然保留
+- **位置**: `plugin/manager.go:184-207`
+- **触发时机**: 用户被删除前的回调阶段调用
+- **作用范围**: **仅处理内存中的插件实例，不涉及任何数据库操作**
 - **关键操作**:
   ```go
-  for _, p := range m.plugins {
-      pluginConf, err := m.db.GetPluginConfByUserAndPath(userID, ...)
-      if pluginConf.Enabled {
-          inst.Disable()  // 先禁用
+  func (m *Manager) RemoveUser(userID uint) error {
+      for _, p := range m.plugins {
+          pluginConf, err := m.db.GetPluginConfByUserAndPath(userID, ...)
+          if pluginConf.Enabled {
+              inst.Disable()                // 先禁用插件（内存状态变更）
+          }
+          delete(m.instances, pluginConf.ID) // 从内存映射中移除引用
       }
-      delete(m.instances, pluginConf.ID)  // 从实例映射中删除
+      return nil
   }
   ```
+- **对持久化数据的影响**:
+  - ❌ **不删除**数据库中 `PluginConf` 记录
+  - ❌ **不清除**Storage 字段数据
+  - ✅ 仅回收内存中的插件实例对象
+  - ⚠️ `RemoveUser` 执行完成后，数据库记录仍完整存在
 
 ---
 
@@ -276,7 +284,7 @@ type PluginConf struct {
     │  1. 数据写入阶段        │
     │     (进程 A)            │
     │  - 插件调用 Save(data)  │
-    │  - 写入 PluginConf      │
+    │  - 更新 PluginConf      │
     └───────────┬─────────────┘
                 │
                 ▼
@@ -293,7 +301,7 @@ type PluginConf struct {
 ┌─────────────────┐   ┌─────────────────┐
 │ 3. 跨进程读取   │   │ 4. 进程重启恢复 │
 │    (进程 B)     │   │    (任意进程)   │
-│ - 插件 Load()   │   │ - 重新创建实例  │
+│ - 插件 Load()   │   │ - 重建实例      │
 │ - 获取 data     │   │ - 绑定 Handler  │
 └────────┬────────┘   └────────┬────────┘
          │                      │
@@ -311,7 +319,8 @@ type PluginConf struct {
                       ▼
           ┌─────────────────────────┐
           │  6. 内存实例回收        │
-          │     (RemoveUser)        │
+          │   (RemoveUser 回调)     │
+          │  - 遍历禁用插件         │
           │  - delete(m.instances)  │
           │  - GC 回收内存           │
           │  - 数据库记录仍保留     │
@@ -320,8 +329,9 @@ type PluginConf struct {
                       ▼
           ┌─────────────────────────┐
           │  7. 数据库记录删除      │
-          │     (用户删除级联)      │
-          │  - DELETE PluginConf    │
+          │  (DeleteUserByID)       │
+          │  - 遍历所有 PluginConf  │
+          │  - DeletePluginConfByID │
           │  - Storage 字段清除     │
           │  - 数据永久删除         │
           └─────────────────────────┘
@@ -423,51 +433,105 @@ return m.db.UpdatePluginConf(conf)        // 只更新 Enabled 字段
 - ✅ 下次 Enable 后可直接继续使用之前的存储数据
 - ❌ 仅停止插件运行，不清理任何存储
 
-#### 阶段 6: 内存实例回收（用户删除）
+#### 阶段 6: 内存实例回收（RemoveUser 回调阶段）
 
-**触发时机**: 用户被删除时调用 `RemoveUser`
+**触发时机**: 用户删除流程开始前，插件管理器的回调入口
 
-**执行流程** (`plugin/manager.go:184-208`):
+**调用位置**: 用户删除 API 处理流程中，先调用 `plugin.Manager.RemoveUser()`，再执行数据库删除
+
+**执行流程** (`plugin/manager.go:184-207`):
 ```go
 func (m *Manager) RemoveUser(userID uint) error {
     for _, p := range m.plugins {
-        pluginConf, err := m.db.GetPluginConfByUserAndPath(userID, ...)
-        if pluginConf.Enabled {
-            inst.Disable()                // 先禁用插件
+        pluginConf, err := m.db.GetPluginConfByUserAndPath(userID, p.PluginInfo().ModulePath)
+        if err != nil {
+            return err
         }
-        delete(m.instances, pluginConf.ID) // 从内存映射中移除引用
+        if pluginConf == nil {
+            continue
+        }
+        if pluginConf.Enabled {
+            inst, err := m.Instance(pluginConf.ID)
+            if err != nil {
+                continue
+            }
+            m.mutex.Lock()
+            err = inst.Disable()  // 内存层面禁用插件
+            m.mutex.Unlock()
+            if err != nil {
+                return err
+            }
+        }
+        delete(m.instances, pluginConf.ID)  // 从内存映射移除
     }
     return nil
 }
 ```
 
+**本阶段作用**:
+1. **优雅停机**: 先调用插件的 `Disable()` 方法，让插件有机会清理资源
+2. **内存回收**: 从 `m.instances` 映射移除引用，等待 GC 回收实例内存
+3. **边界清理**: 确保后续数据库删除时，不会有内存中的插件实例仍在运行
+
+**本阶段不做的操作**:
+- ❌ **不删除**数据库中的 `PluginConf` 记录
+- ❌ **不清除**Storage 字段的任何数据
+- ❌ 不处理跨进程中其他实例的状态
+
 **对持久化数据的影响**:
-- ✅ 数据库中 `PluginConf` 记录 **仍保留**
-- ✅ Storage 字段数据 **完整保留**
-- ❌ 仅回收内存中的插件实例对象
-- ⚠️ 此时虽然数据库记录存在，但已无内存实例可访问存储数据
+- ✅ 数据库中 `PluginConf` 记录 **完整保留**
+- ✅ Storage 字段数据 **完全保留**
+- ⚠️ 仅回收内存，数据库层面无任何变更
 
-#### 阶段 7: 数据库记录删除（数据清除）
+#### 阶段 7: 数据库记录删除（DeleteUserByID 阶段）
 
-**触发时机**: 用户被从数据库中删除时的级联操作
+**触发时机**: `RemoveUser` 回调完成后，进入数据库删除阶段
 
-**删除流程** (`database/user.go` 中的用户删除逻辑):
+**执行位置**: `database/user.go:54-69`
+
+**删除流程**:
 ```go
-// 删除用户前，先删除关联的插件配置
-func (d *GormDatabase) DeleteUser(id uint) error {
-    // 1. 删除该用户所有插件配置（包含 Storage 字段）
-    if err := d.DB.Where("user_id = ?", id).Delete(&model.PluginConf{}).Error; err != nil {
-        return err
+// 删除用户的完整流程
+func (d *GormDatabase) DeleteUserByID(id uint) error {
+    // 1. 删除用户的所有应用
+    apps, _ := d.GetApplicationsByUser(id)
+    for _, app := range apps {
+        d.DeleteApplicationByID(app.ID)
     }
-    // 2. 删除用户
-    return d.DB.Delete(&model.User{}, id).Error
+    
+    // 2. 删除用户的所有客户端
+    clients, _ := d.GetClientsByUser(id)
+    for _, client := range clients {
+        d.DeleteClientByID(client.ID)
+    }
+    
+    // 3. 删除用户的所有插件配置（代码层面遍历删除，非数据库级联）
+    pluginConfs, _ := d.GetPluginConfByUser(id)
+    for _, conf := range pluginConfs {
+        d.DeletePluginConfByID(conf.ID)  // 此处 Storage 数据被永久删除
+    }
+    
+    // 4. 最后删除用户本身
+    return d.DB.Where("id = ?", id).Delete(&model.User{}).Error
 }
 ```
 
+**`DeletePluginConfByID` 实现** (`database/plugin.go:80-83`):
+```go
+func (d *GormDatabase) DeletePluginConfByID(id uint) error {
+    return d.DB.Where("id = ?", id).Delete(&model.PluginConf{}).Error
+}
+```
+
+**本阶段作用**:
+1. **数据清理**: 从数据库中物理删除 `PluginConf` 整条记录，包括 Config 和 Storage 字段
+2. **完整性保证**: 遍历删除确保该用户的所有插件配置都被清除
+3. **存储释放**: Storage 字段占用的数据库空间被释放
+
 **最终结果**:
-- `PluginConf` 记录被 DELETE
-- Storage 字段的数据永久丢失
-- 跨进程持久化闭环完成
+- ✅ `PluginConf` 记录被 `DELETE` 语句物理删除
+- ✅ Storage 字段的数据永久丢失，不可恢复
+- ✅ 跨进程持久化闭环正式完成
 
 ---
 
@@ -475,28 +539,36 @@ func (d *GormDatabase) DeleteUser(id uint) error {
 
 ### 4.1 数据生命周期矩阵
 
-| 操作阶段 | 内存实例状态 | Storage Handler 绑定 | 数据库 Storage 数据 | 跨进程可见性 |
-|---------|------------|-------------------|-------------------|------------|
-| 实例创建 | ✅ 存在 | ⚠️ 检测中 | ✅ 空/初始值 | ✅ |
-| 写入数据 | ✅ 存在 | ✅ 已绑定 | ✅ 已更新 | ✅ 立即可见 |
-| 读取数据 | ✅ 存在 | ✅ 已绑定 | ✅ 读取最新 | ✅ 读取其他进程写入 |
-| 插件禁用 | ✅ 存在 | ✅ 仍绑定 | ✅ 保留 | ✅ 其他进程仍可见 |
-| 内存回收 | ❌ 已删除 | ❌ 随实例回收 | ✅ 仍保留 | ⚠️ 无实例可访问 |
-| 数据库删除 | ❌ 已删除 | ❌ 随实例回收 | ❌ 永久删除 | ❌ 不可访问 |
+| 操作阶段 | 触发方法 | 内存实例状态 | Storage Handler 绑定 | 数据库 Storage 数据 | 跨进程可见性 |
+|---------|---------|------------|-------------------|-------------------|------------|
+| 实例创建 | initializeForUser | ✅ 存在 | ⚠️ 检测中 | ✅ 空/初始值 | ✅ |
+| 写入数据 | dbStorageHandler.Save | ✅ 存在 | ✅ 已绑定 | ✅ 已更新 | ✅ 立即可见 |
+| 读取数据 | dbStorageHandler.Load | ✅ 存在 | ✅ 已绑定 | ✅ 读取最新 | ✅ 读取其他进程写入 |
+| 插件禁用 | instance.Disable | ✅ 存在 | ✅ 仍绑定 | ✅ 保留 | ✅ 其他进程仍可见 |
+| 内存回收（回调阶段） | RemoveUser | ❌ 已删除 | ❌ 随实例回收 | ✅ 仍保留 | ⚠️ 无实例可访问，但数据仍在库 |
+| 数据库删除 | DeletePluginConfByID | ❌ 已删除 | ❌ 随实例回收 | ❌ 永久删除 | ❌ 不可访问 |
 
-### 4.2 跨进程一致性保证
+### 4.2 双阶段删除的职责划分
+
+| 删除阶段 | 负责模块 | 调用时机 | 作用范围 | 核心职责 |
+|---------|---------|---------|---------|---------|
+| 阶段 6: 内存回收 | plugin.Manager | 用户删除前回调 | 内存中的插件实例 | 优雅停机、内存回收 |
+| 阶段 7: 数据删除 | database.GormDatabase | 回调完成后 | 数据库中的 PluginConf 记录 | 物理删除数据、释放存储空间 |
+
+### 4.3 跨进程一致性保证
 
 1. **无缓存设计**: 每次 Load 都直接查数据库，避免缓存不一致
 2. **原子更新**: Save 操作是单条数据库记录更新，保证原子性
-3. **最终一致**: 由于无缓存，进程间数据立即可见，实现强一致性
+3. **强一致性**: 由于无缓存，进程间数据立即可见
+4. **跨进程删除通知**: 删除是数据库级别的物理删除，所有进程下一次查询时都会感知到记录已不存在
 
-### 4.3 资源回收分层策略
+### 4.4 资源回收分层策略
 
-| 层级 | 回收时机 | 回收方式 |
-|-----|---------|---------|
-| 插件运行态 | 用户调用 Disable | 调用 Disable() 方法 |
-| 内存实例 | 用户被删除 | delete(map) + GC |
-| 数据库记录 | 用户被删除 | DELETE SQL 级联删除 |
+| 层级 | 回收时机 | 回收方式 | 负责模块 |
+|-----|---------|---------|---------|
+| 插件运行态 | 用户调用 Disable 或 RemoveUser | 调用 Disable() 方法 | plugin.Manager |
+| 内存实例 | RemoveUser 回调阶段 | delete(map) + Go GC | plugin.Manager |
+| 数据库记录 | DeleteUserByID 阶段 | DELETE SQL 语句遍历删除 | database.GormDatabase |
 
 ---
 
@@ -510,7 +582,9 @@ func (d *GormDatabase) DeleteUser(id uint) error {
 | 启用状态判断（路径 B） | `plugin/manager.go` | 353-362 |
 | 插件启用/禁用 | `plugin/manager.go` | 134-147 |
 | 用户插件初始化 | `plugin/manager.go` | 315-364 |
-| 用户删除内存回收 | `plugin/manager.go` | 184-208 |
+| RemoveUser 内存回收回调 | `plugin/manager.go` | 184-207 |
+| DeleteUserByID 数据库删除 | `database/user.go` | 54-69 |
+| DeletePluginConfByID 实现 | `database/plugin.go` | 80-83 |
 | PluginConf 数据模型 | `model/pluginconf.go` | 4-13 |
 | 能力检测函数 | `plugin/compat/instance.go` | 51-59 |
 
@@ -524,7 +598,8 @@ func (d *GormDatabase) DeleteUser(id uint) error {
 2. **数据库持久化**: 天然支持跨进程、跨重启的数据共享
 3. **用户级隔离**: 每个用户的插件数据完全独立
 4. **优雅降级**: 初始化失败时自动禁用，不影响主程序运行
-5. **分层回收**: 运行态、内存、数据库三层独立回收，灵活可控
+5. **两阶段删除**: 先回收内存、再删除数据，职责划分清晰
+6. **分层回收**: 运行态、内存、数据库三层独立回收，灵活可控
 
 ### 6.2 注意事项与限制
 
@@ -533,6 +608,7 @@ func (d *GormDatabase) DeleteUser(id uint) error {
 3. **内存泄漏风险**: 插件禁用后实例仍在内存中，只有用户删除时才会清理内存
 4. **无缓存机制**: 每次 Load 都直接查询数据库，频繁操作可能影响性能
 5. **禁用后数据保留**: 禁用插件不会清理 Storage，需要手动处理数据清理需求
+6. **非级联删除**: 插件配置删除是代码层面遍历删除，而非数据库外键级联
 
 ### 6.3 潜在优化点
 
@@ -541,3 +617,4 @@ func (d *GormDatabase) DeleteUser(id uint) error {
 3. 可添加 Storage 数据的版本字段，支持数据迁移
 4. 可提供插件级别的 Storage 清理 API，允许用户手动清除存储数据
 5. 可添加 Storage 数据大小限制，防止单个插件占用过多数据库空间
+6. 可考虑使用数据库外键级联删除替代代码层面的遍历删除
