@@ -380,21 +380,24 @@ func (d *GormDatabase) GetMessagesByUserSince(userID uint, limit int, since uint
 
 **改进方案**：
 
-##### 方案一：仅前端改进（利用现有接口）
+##### 方案一：仅前端改进（增量更新，不破坏现有视图）
 
-**原理**：重连后调用 `refreshByApp()` 清空并重新加载，虽然会重新获取所有消息，但能确保数据完整。
+**原理**：利用现有 `GET /message?since=0` 接口（`since=0` 时不做ID过滤，返回最新消息），追踪本地最大消息ID，重连后获取最新消息并增量合并到现有视图，**不调用 `clearAll()`**。
+
+**代码实现**：
 
 ```typescript
-// WebSocketStore.ts - 重连成功后触发刷新
+// WebSocketStore.ts - 追踪最新消息ID并触发增量更新
 export class WebSocketStore {
     private lastMessageId = 0;
 
-    public listen = (callback: (msg: IMessage) => void, onReconnect: () => void) => {
+    public listen = (callback: (msg: IMessage) => void, onReconnect: (lastId: number) => void) => {
+        const wsUrl = config.get('url').replace('http', 'ws').replace('https', 'wss');
         const ws = new WebSocket(wsUrl + 'stream');
-        
+
         ws.onopen = () => {
             if (this.lastMessageId > 0) {
-                onReconnect();  // 触发消息刷新
+                onReconnect(this.lastMessageId);  // 传入本地最新消息ID
             }
         };
 
@@ -403,81 +406,45 @@ export class WebSocketStore {
             this.lastMessageId = Math.max(this.lastMessageId, msg.id);
             callback(msg);
         };
-        // ...
+
+        ws.onclose = () => {
+            this.wsActive = false;
+            if (!this.currentUser.loggedIn) {
+                return;
+            }
+            this.currentUser
+                .tryAuthenticate()
+                .then(() => {
+                    setTimeout(() => this.listen(callback, onReconnect), 30000);
+                });
+        };
+
+        this.ws = ws;
     };
 }
 
-// MessagesStore.ts - 刷新所有已加载的消息视图
+// MessagesStore.ts - 增量合并离线期间的消息
 @action
-public onReconnect = () => {
-    if (this.exists(AllMessages)) {
-        this.refreshByApp(AllMessages);
-    }
-    Object.keys(this.state).forEach(appIdStr => {
-        const appId = parseInt(appIdStr, 10);
-        if (this.exists(appId) && appId !== AllMessages) {
-            this.refreshByApp(appId);
-        }
-    });
-};
-```
-
-**缺点**：会重新加载所有消息，产生不必要的网络请求。
-
----
-
-##### 方案二：新增后端接口（推荐）
-
-**需要新增的后端能力**：
-
-```go
-// 新增 API 接口：获取指定ID之后的消息（ID大于指定值）
-// GET /message?after={id}
-
-// database/message.go - 新增方法
-func (d *GormDatabase) GetMessagesByUserAfter(userID uint, limit int, after uint) ([]*model.Message, error) {
-    var messages []*model.Message
-    db := d.DB.Joins("JOIN applications ON applications.user_id = ?", userID).
-        Where("messages.application_id = applications.id").Order("messages.id desc").Limit(limit)
-    if after != 0 {
-        db = db.Where("messages.id > ?", after)  // 获取ID大于after的消息
-    }
-    err := db.Find(&messages).Error
-    // ...
-}
-
-// api/message.go - 新增接口处理
-func (a *MessageAPI) GetMessagesAfter(ctx *gin.Context) {
-    userID := auth.GetUserID(ctx)
-    var params struct {
-        Limit int  `form:"limit" binding:"min=1,max=200"`
-        After uint `form:"after" binding:"min=0"`
-    }
-    if err := ctx.Bind(&params); err != nil {
-        return
-    }
-    messages, err := a.DB.GetMessagesByUserAfter(userID, params.Limit, params.After)
-    // ... 返回消息列表
-}
-```
-
-**前端配合改进**：
-
-```typescript
-// MessagesStore.ts - 增量获取离线期间的消息
-@action
-public fetchMissedMessages = async (afterId: number) => {
-    const result = await axios.get(config.get('url') + 'message?after=' + afterId);
-    const newMessages = result.data.messages as IMessage[];
+public fetchMissedMessages = async (lastLocalId: number) => {
+    // 使用 since=0 获取最新的一批消息（默认limit=100）
+    const result = await axios.get(config.get('url') + 'message?since=0');
+    const latestMessages = result.data.messages as IMessage[];
     
     runInAction(() => {
+        // 筛选出ID大于本地最大ID的新消息
+        const newMessages = latestMessages.filter(m => m.id > lastLocalId);
+        
         if (newMessages.length > 0) {
-            // 更新全局视图
+            // 更新全局视图（AllMessages = -1）
             if (this.exists(AllMessages)) {
                 const allState = this.stateOf(AllMessages);
-                allState.messages.replace([...newMessages, ...allState.messages]);
+                // 去重后合并到头部
+                const existingIds = new Set(allState.messages.map(m => m.id));
+                const uniqueMessages = newMessages.filter(m => !existingIds.has(m.id));
+                allState.messages.replace([...uniqueMessages, ...allState.messages]);
             }
-            // 更新应用视图
+            
+            // 更新各应用视图
             newMessages.forEach(msg => {
                 if (this.exists(msg.appid)) {
                     const appState = this.stateOf(msg.appid);
@@ -490,14 +457,118 @@ public fetchMissedMessages = async (afterId: number) => {
         }
     });
 };
+
+// stores.tsx - 集成
+const wsStore = new WebSocketStore(snackManager, currentUser);
+wsStore.listen(
+    (msg) => messagesStore.publishSingleMessage(msg),
+    (lastId) => messagesStore.fetchMissedMessages(lastId)
+);
 ```
 
-**改进收益对比**：
+**方案一特点**：
 
-| 方案 | 改动范围 | 网络开销 | 实现复杂度 | 推荐度 |
-|------|----------|----------|------------|--------|
-| 方案一 | 仅前端 | 高（全量重加载） | 低 | ⭐⭐ |
-| 方案二 | 前后端 | 低（增量加载） | 中 | ⭐⭐⭐⭐⭐ |
+| 维度 | 说明 |
+|------|------|
+| **改动范围** | 仅前端，无需后端变更 |
+| **网络开销** | 中等（每次重连获取最新100条消息） |
+| **视图影响** | 不破坏现有状态，增量更新 |
+| **去重机制** | 通过消息ID判断，避免重复 |
+| **适用场景** | 消息量不大（<100条/离线周期），快速落地 |
+
+---
+
+##### 方案二：新增后端接口（推荐，增量精准拉取）
+
+**原理**：新增 `GET /message?after={id}` 接口，支持 `messages.id > after` 查询语义，实现精准的增量拉取。
+
+**需要新增的后端能力**：
+
+```go
+// database/message.go - 新增方法
+func (d *GormDatabase) GetMessagesByUserAfter(userID uint, limit int, after uint) ([]*model.Message, error) {
+    var messages []*model.Message
+    db := d.DB.Joins("JOIN applications ON applications.user_id = ?", userID).
+        Where("messages.application_id = applications.id").Order("messages.id desc").Limit(limit)
+    if after != 0 {
+        db = db.Where("messages.id > ?", after)  // 获取ID大于after的消息
+    }
+    err := db.Find(&messages).Error
+    if err == gorm.ErrRecordNotFound {
+        err = nil
+    }
+    return messages, err
+}
+
+// api/message.go - 新增接口处理
+func (a *MessageAPI) GetMessagesAfter(ctx *gin.Context) {
+    userID := auth.GetUserID(ctx)
+    var params struct {
+        Limit int  `form:"limit" binding:"min=1,max=200"`
+        After uint `form:"after" binding:"min=0"`
+    }
+    params.Limit = 100
+    if err := ctx.Bind(&params); err != nil {
+        return
+    }
+    messages, err := a.DB.GetMessagesByUserAfter(userID, params.Limit, params.After)
+    if success := successOrAbort(ctx, 500, err); !success {
+        return
+    }
+    ctx.JSON(200, toExternalMessages(messages))
+}
+```
+
+**前端配合改进**：
+
+```typescript
+// MessagesStore.ts - 精准增量拉取
+@action
+public fetchMissedMessages = async (afterId: number) => {
+    const result = await axios.get(config.get('url') + 'message?after=' + afterId);
+    const newMessages = result.data as IMessage[];
+    
+    runInAction(() => {
+        if (newMessages.length > 0) {
+            // 更新全局视图
+            if (this.exists(AllMessages)) {
+                const allState = this.stateOf(AllMessages);
+                allState.messages.replace([...newMessages, ...allState.messages]);
+            }
+            // 更新应用视图
+            newMessages.forEach(msg => {
+                if (this.exists(msg.appid)) {
+                    const appState = this.stateOf(msg.appid);
+                    appState.messages.unshift(msg);
+                }
+            });
+        }
+    });
+};
+```
+
+**方案二特点**：
+
+| 维度 | 说明 |
+|------|------|
+| **改动范围** | 前后端都需修改 |
+| **网络开销** | 低（仅获取离线期间新增的消息） |
+| **视图影响** | 不破坏现有状态，精准增量更新 |
+| **去重机制** | 天然去重（ID唯一且递增） |
+| **适用场景** | 消息量大，追求最优性能 |
+
+---
+
+##### 方案对比与适用边界
+
+| 维度 | 方案一（前端增量） | 方案二（新增接口） |
+|------|-------------------|-------------------|
+| **改动成本** | 低（仅前端） | 中（前后端） |
+| **网络开销** | 中等（固定100条） | 低（按需） |
+| **实现复杂度** | 低 | 中 |
+| **风险** | 高消息量时可能遗漏 | 需测试新接口 |
+| **适用场景** | 小流量、快速验证 | 生产环境、高消息量 |
+| **推荐度** | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
 
 ---
 
