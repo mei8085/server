@@ -257,23 +257,156 @@ public loadMore = async (appId: number) => {
 
 ### 5.3 离线重连回填流程
 
+#### 5.3.1 当前已实现的行为链路
+
+**链路描述**：
+
+1. **连接断开检测**：WebSocket 连接断开时触发 `ws.onclose` 回调
+2. **认证状态检查**：若用户未登录则直接返回，不进行重连
+3. **重新认证尝试**：调用 `currentUser.tryAuthenticate()` 验证身份有效性
+4. **延迟重连**：认证成功后等待30秒，重新调用 `listen()` 建立连接
+5. **认证失败处理**：若认证返回401则登出用户
+
+**代码证据**：
+
+1. **WebSocket断开与重连** (`ui/src/message/WebSocketStore.ts:25-48`)：
+```typescript
+ws.onclose = () => {
+    this.wsActive = false;
+    if (!this.currentUser.loggedIn) {
+        return;
+    }
+    this.currentUser
+        .tryAuthenticate()
+        .then(() => {
+            this.snack('WebSocket connection closed, trying again in 30 seconds.');
+            setTimeout(() => this.listen(callback), 30000);
+        })
+        .catch((error: AxiosError) => {
+            if (error?.response?.status === 401) {
+                this.snack('Could not authenticate with client token, logging out.');
+            }
+        });
+};
 ```
-离线状态
-    ↓
-WebSocket断开
-    ↓
-30秒后尝试重连
-    ↓
-重连成功
-    ↓
-检测本地最新消息ID
-    ↓
-调用 loadMore(since=localMaxId)
-    ↓
-加载离线期间的消息
-    ↓
-merge到本地存储
+
+2. **分页加载机制** (`ui/src/message/MessagesStore.ts:48-71`)：
+```typescript
+@action
+public loadMore = async (appId: number) => {
+    const state = this.stateOf(appId);
+    if (!state.hasMore || this.loading) {
+        return Promise.resolve();
+    }
+    this.loading = true;
+    try {
+        const pagedResult = await this.fetchMessages(appId, state.nextSince).then(
+            (resp) => resp.data
+        );
+        runInAction(() => {
+            state.messages.replace([...state.messages, ...pagedResult.messages]);
+            state.nextSince = pagedResult.paging.since ?? 0;
+            state.hasMore = 'next' in pagedResult.paging;
+            state.loaded = true;
+        });
+    } finally {
+        this.loading = false;
+    }
+    return Promise.resolve();
+};
 ```
+
+3. **服务端分页查询** (`api/message.go:88-98`)：
+```go
+func (a *MessageAPI) GetMessages(ctx *gin.Context) {
+    userID := auth.GetUserID(ctx)
+    withPaging(ctx, func(params *pagingParams) {
+        messages, err := a.DB.GetMessagesByUserSince(userID, params.Limit+1, params.Since)
+        if success := successOrAbort(ctx, 500, err); !success {
+            return
+        }
+        ctx.JSON(200, buildWithPaging(ctx, params, messages))
+    })
+}
+```
+
+**关键说明**：
+- **无主动回填**：重连成功后不会主动拉取离线期间的消息
+- **`since` 参数**：`loadMore` 使用 `state.nextSince`（上次加载的最后一条消息ID），而非本地最新消息ID
+- **离线消息获取方式**：用户需手动点击"Refresh"按钮调用 `refreshByApp()`，或通过滚动加载更多历史消息
+
+---
+
+#### 5.3.2 可选改进
+
+**当前限制**：
+
+| 限制 | 说明 |
+|------|------|
+| 无主动回填 | 离线期间消息不会自动出现在列表中 |
+| 无消息ID追踪 | 无法精确确定离线期间产生了哪些消息 |
+| 无去重保护 | 重连后可能收到已存在的消息 |
+
+**改进方案**：
+
+1. **WebSocketStore 追踪最新消息ID**：
+```typescript
+export class WebSocketStore {
+    private lastMessageId = 0;
+
+    public listen = (callback: (msg: IMessage) => void, fetchMissed: (sinceId: number) => void) => {
+        const ws = new WebSocket(wsUrl + 'stream');
+        
+        ws.onopen = () => {
+            if (this.lastMessageId > 0) {
+                fetchMissed(this.lastMessageId);
+            }
+        };
+
+        ws.onmessage = (data) => {
+            const msg = JSON.parse(data.data) as IMessage;
+            this.lastMessageId = Math.max(this.lastMessageId, msg.id);
+            callback(msg);
+        };
+        // ... 其余逻辑不变
+    };
+}
+```
+
+2. **MessagesStore 添加离线消息回填方法**：
+```typescript
+@action
+public fetchMissedMessages = async (sinceId: number) => {
+    if (this.exists(AllMessages)) {
+        await this.fetchMissedForApp(AllMessages, sinceId);
+    }
+    Object.keys(this.state).forEach(appIdStr => {
+        const appId = parseInt(appIdStr, 10);
+        if (this.exists(appId) && appId !== AllMessages) {
+            this.fetchMissedForApp(appId, sinceId);
+        }
+    });
+};
+
+private fetchMissedForApp = async (appId: number, sinceId: number) => {
+    const state = this.stateOf(appId);
+    const pagedResult = await this.fetchMessages(appId, sinceId).then(r => r.data);
+    
+    runInAction(() => {
+        const existingIds = new Set(state.messages.map(m => m.id));
+        const newMessages = pagedResult.messages.filter(m => !existingIds.has(m.id));
+        state.messages.replace([...newMessages, ...state.messages]);
+    });
+};
+```
+
+**改进收益**：
+
+| 改进项 | 收益 |
+|--------|------|
+| 主动回填 | 重连后自动获取离线消息，无需手动刷新 |
+| 精确拉取 | 根据本地最新ID确定拉取范围 |
+| 消息去重 | 避免重复消息 |
 
 ---
 
