@@ -497,30 +497,34 @@ func (m *Manager) RemoveUser(userID uint) error {
 
 **执行位置**: `database/user.go:54-69`
 
-**实际调用顺序**:
+**实际调用顺序**（注意：中间步骤不处理返回错误，仅最后一步返回用户删除的错误）:
 ```go
 // 删除用户的完整数据库操作流程
 func (d *GormDatabase) DeleteUserByID(id uint) error {
-    // 步骤 1: 删除该用户的所有应用（Application）
+    // 步骤 1: 尝试删除该用户的所有应用（Application）
+    //         注意：GetApplicationsByUser 的错误被忽略，DeleteApplicationByID 的返回值也不处理
     apps, _ := d.GetApplicationsByUser(id)
     for _, app := range apps {
         d.DeleteApplicationByID(app.ID)
     }
     
-    // 步骤 2: 删除该用户的所有客户端（Client）
+    // 步骤 2: 尝试删除该用户的所有客户端（Client）
+    //         注意：GetClientsByUser 的错误被忽略，DeleteClientByID 的返回值也不处理
     clients, _ := d.GetClientsByUser(id)
     for _, client := range clients {
         d.DeleteClientByID(client.ID)
     }
     
-    // 步骤 3: 删除该用户的所有插件配置（PluginConf）
-    //         此处 Storage 数据被永久删除
+    // 步骤 3: 尝试删除该用户的所有插件配置（PluginConf）
+    //         注意：GetPluginConfByUser 的错误被忽略，DeletePluginConfByID 的返回值也不处理
+    //         此处 Storage 数据被尝试删除
     pluginConfs, _ := d.GetPluginConfByUser(id)
     for _, conf := range pluginConfs {
         d.DeletePluginConfByID(conf.ID)
     }
     
     // 步骤 4: 最后删除用户本身（User）
+    //         注意：只有这一步的错误会被返回
     return d.DB.Where("id = ?", id).Delete(&model.User{}).Error
 }
 ```
@@ -532,13 +536,18 @@ func (d *GormDatabase) DeletePluginConfByID(id uint) error {
 }
 ```
 
-**本阶段作用**:
-1. **按顺序清理关联数据**: 应用 → 客户端 → 插件配置 → 用户，遵循外键依赖顺序
-2. **数据清理**: 从数据库中物理删除 `PluginConf` 整条记录，包括 Config 和 Storage 字段
-3. **完整性保证**: 遍历删除确保该用户的所有插件配置都被清除
-4. **存储释放**: Storage 字段占用的数据库空间被释放
+**删除可靠性说明**:
+- ✅ **会按顺序尝试清理**: 应用 → 客户端 → 插件配置 → 用户，遵循外键依赖顺序尝试
+- ⚠️ **中间步骤不逐项处理错误**: 查询和删除操作的错误被忽略，不中断流程
+- ⚠️ **无强一致性保证**: 如果中间某步删除失败，流程仍会继续向后执行，可能残留部分数据
+- ⚠️ **仅返回用户删除的错误**: 只有最后一步删除用户本身的错误会被返回，前面的失败不会被感知
 
-**最终结果**:
+**本阶段作用**:
+1. **按顺序尝试清理关联数据**: 按应用 → 客户端 → 插件配置 → 用户的依赖顺序尝试删除
+2. **数据清理（尽力而为）**: 尝试从数据库中物理删除 `PluginConf` 整条记录，包括 Config 和 Storage 字段
+3. **存储释放**: 成功删除的 Storage 字段占用的数据库空间会被释放
+
+**最终结果（在所有步骤都成功的情况下）**:
 - ✅ `PluginConf` 记录被 `DELETE` 语句物理删除
 - ✅ Storage 字段的数据永久丢失，不可恢复
 - ✅ 跨进程持久化闭环正式完成
@@ -556,21 +565,21 @@ func (d *GormDatabase) DeletePluginConfByID(id uint) error {
 | 读取数据 | dbStorageHandler.Load | 只读查询 | ✅ 存在 | ✅ 已绑定 | ✅ 读取最新 | ✅ 读取其他进程写入 |
 | 插件禁用 | instance.Disable | UPDATE 写入 | ✅ 存在 | ✅ 仍绑定 | ✅ 保留 | ✅ 其他进程仍可见 |
 | 内存回收（回调阶段） | RemoveUser | 仅只读查询 | ❌ 已删除 | ❌ 随实例回收 | ✅ 仍完整保留 | ⚠️ 无实例可访问，但数据仍在库 |
-| 数据库删除 | DeletePluginConfByID | DELETE 删除 | ❌ 已删除 | ❌ 随实例回收 | ❌ 永久删除 | ❌ 不可访问 |
+| 数据库删除 | DeletePluginConfByID | DELETE 删除（尽力而为） | ❌ 已删除 | ❌ 随实例回收 | ⚠️ 成功删除后永久丢失 | ⚠️ 若删除失败仍可能被访问 |
 
 ### 4.2 双阶段删除的职责划分
 
 | 删除阶段 | 负责模块 | 调用时机 | 数据库操作 | 作用范围 | 核心职责 |
 |---------|---------|---------|---------|---------|---------|
 | 阶段 6：内存回收 | plugin.Manager | 用户删除前回调 | 仅只读查询，无任何写入删除 | 内存中的插件实例 | 读取配置、优雅停机、内存回收 |
-| 阶段 7：数据删除 | database.GormDatabase | 回调完成后 | 按顺序 DELETE 删除 | 数据库中的 PluginConf 记录 | 物理删除数据、释放存储空间 |
+| 阶段 7：数据删除 | database.GormDatabase | 回调完成后 | 按顺序尝试 DELETE，中间步骤不处理错误 | 数据库中的 PluginConf 记录 | 尽力尝试物理删除数据、释放存储空间 |
 
 ### 4.3 跨进程一致性保证
 
 1. **无缓存设计**: 每次 Load 都直接查数据库，避免缓存不一致
 2. **原子更新**: Save 操作是单条数据库记录更新，保证原子性
-3. **强一致性**: 由于无缓存，进程间数据立即可见
-4. **跨进程删除通知**: 删除是数据库级别的物理删除，所有进程下一次查询时都会感知到记录已不存在
+3. **最终一致**: 由于无缓存，进程间数据立即可见
+4. **跨进程删除通知**: 删除是数据库级别的物理删除，所有进程下一次查询时都会感知到记录已不存在（如果删除成功的话）
 
 ### 4.4 资源回收分层策略
 
@@ -578,7 +587,7 @@ func (d *GormDatabase) DeletePluginConfByID(id uint) error {
 |-----|---------|---------|---------|
 | 插件运行态 | 用户调用 Disable 或 RemoveUser | 调用 Disable() 方法 | plugin.Manager |
 | 内存实例 | RemoveUser 回调阶段 | delete(map) + Go GC | plugin.Manager |
-| 数据库记录 | DeleteUserByID 阶段，按应用→客户端→插件→用户顺序 | DELETE SQL 语句遍历删除 | database.GormDatabase |
+| 数据库记录 | DeleteUserByID 阶段，按应用→客户端→插件→用户顺序尽力尝试 | DELETE SQL 语句遍历尝试删除，中间步骤不处理错误 | database.GormDatabase |
 
 ---
 
@@ -618,7 +627,8 @@ func (d *GormDatabase) DeletePluginConfByID(id uint) error {
 3. **内存泄漏风险**: 插件禁用后实例仍在内存中，只有用户删除时才会清理内存
 4. **无缓存机制**: 每次 Load 都直接查询数据库，频繁操作可能影响性能
 5. **禁用后数据保留**: 禁用插件不会清理 Storage，需要手动处理数据清理需求
-6. **非级联删除**: 插件配置删除是代码层面遍历删除，而非数据库外键级联
+6. **非级联删除**: 插件配置删除是代码层面遍历尝试删除，而非数据库外键级联
+7. **删除无强保证**: 删除流程中中间步骤不逐项处理错误，无法保证所有关联数据都被完全清除
 
 ### 6.3 潜在优化点
 
@@ -627,4 +637,6 @@ func (d *GormDatabase) DeletePluginConfByID(id uint) error {
 3. 可添加 Storage 数据的版本字段，支持数据迁移
 4. 可提供插件级别的 Storage 清理 API，允许用户手动清除存储数据
 5. 可添加 Storage 数据大小限制，防止单个插件占用过多数据库空间
-6. 可考虑使用数据库外键级联删除替代代码层面的遍历删除
+6. 可考虑使用数据库外键级联删除替代代码层面的遍历尝试删除
+7. 可完善删除流程的错误处理，对中间步骤的失败进行日志记录或回滚
+8. 可在删除前增加数据完整性校验，确保清理操作的可观测性
