@@ -136,7 +136,7 @@ func requirePluginEnabled(id uint, db Database) gin.HandlerFunc {
 
 ### 3.3 双令牌机制的真实作用
 
-**令牌属性对比表** (`auth/token.go:37-55`):
+**令牌属性对比表** (`auth/token.go:37-55`, `database/application.go:64-71`, `api/application.go:137-206`, `model/application.go:22`):
 
 | 属性 | Plugin Token | Application Token |
 |------|-------------|------------------|
@@ -145,11 +145,31 @@ func requirePluginEnabled(id uint, db Database) gin.HandlerFunc {
 | 生成函数 | `GeneratePluginToken()` | `GenerateApplicationToken()` |
 | 唯一性保证 | `GenerateNotExistingToken()` 循环重试 | 同左 |
 | 数据库索引 | `uniqueIndex:uix_plugin_confs_token` | `uniqueIndex:uix_applications_token` |
-| **暴露方式** | **URL路径明文** | 仅内部使用，不暴露 |
+| **GET /application 返回** | ❌ 无独立API，不在PluginConf暴露 | ✅ **完全返回，含 token 字段** |
+| **Internal标记过滤** | - | ❌ **DB层无过滤，GetApplicationsByUser返回所有** |
+| **DELETE 限制** | - | ✅ 接口层 `if app.Internal` 返回400错误 |
+| **PUT 更新限制** | - | ❌ 无限制，Internal应用可修改名称/描述等 |
+| **UI层行为** | - | ✅ 完全展示，仅删除按钮禁用（`disabled={app.internal}`） |
+| **暴露方式** | **Webhook URL路径明文** | Application列表API明文返回 |
 | **访问控制粒度** | **插件实例级别** | 应用级别 |
 | **用户身份关联** | **无 - 知道URL即访问** | 通过Application关联用户 |
 | 用途1 | Webhook路径凭据 | 消息发送身份标识 |
 | 用途2 | 插件实例唯一标识 | REST API `/message` 认证 |
+
+> **关键校正事实（精确到代码行）**：
+> 1. **数据库层不过滤**：`GetApplicationsByUser` (`database/application.go:64-71`) 无 `WHERE internal=false` 条件，返回全部
+> 2. **API明文返回**：`model.Application.token` 标记 `json:"token"` (`model/application.go:22`)，`GET /application` 完整返回
+> 3. **仅删除受限**：`DELETE /application/:id` (`api/application.go:193-196`) 检查 `if app.Internal` 返回400
+> 4. **更新不受限**：`PUT /application/:id` 无Internal检查，可修改名称、描述、优先级
+> 5. **UI不隐藏**：Applications.tsx 完整渲染所有应用，`Internal=true` 仅导致删除按钮禁用
+
+**安全含义总结**：
+| 令牌类型 | 可见范围 | 可操作性 | 风险等级 | 说明 |
+|---------|---------|---------|---------|------|
+| **Plugin Token** | 仅Webhook URL中 | 无法通过API查询 | 中 | 仅URL泄露风险，知道即可调用Webhook |
+| **Application Token** | 对所属用户完全可见 | 可正常使用发送消息 | 低 | **预期设计**，用户本来就是合法拥有者 |
+
+> 重要：用户**可以看到**插件关联的Application Token，但这是**预期设计** - 用户作为应用的所有者，有权使用该Token发送消息，与用户自己创建的应用Token性质完全相同。
 
 **关键安全结论**：
 1. Plugin Token是**安全性与可用性的权衡** - URL即凭证
@@ -380,7 +400,13 @@ HTTP GET /plugin/5/custom/Pabc123xyz/echo
 
 ---
 
-**复核完成时间**：2026-05-16  
+**二次复核完成时间**：2026-05-16  
 **代码基线**：gotify/server v2 插件系统 git HEAD
-**复核覆盖**：router.go, manager.go, auth/token.go, pluginenabled.go, messagehandler.go  
-**关键更正数**：4项（鉴权路径、令牌作用、阻塞边界、失败边界）
+**复核覆盖**：router.go, manager.go, auth/token.go, pluginenabled.go, messagehandler.go, database/application.go, api/application.go, ui/src/application/Applications.tsx, model/application.go  
+**累计关键更正数**：6项
+1. 鉴权路径（无鉴权）
+2. Plugin Token作用机制
+3. channel阻塞边界
+4. **DB写入失败后仍推送消息（本次）**
+5. **"丢失"与"未持久化"边界定义（本次）**
+6. **Application Token可见性（Internal标记不隐藏）（本次）**
