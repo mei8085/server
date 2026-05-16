@@ -95,6 +95,8 @@ func (a *OIDCAPI) CallbackHandler() gin.HandlerFunc {
 }
 ```
 
+**注意**：浏览器回调中，`resolveUser` 在 `popPendingSession` **之前**执行。如果用户解析成功但 state 校验失败，用户可能已创建但 pendingSession 未被消费。
+
 #### 原生应用 Token 交换 (`/auth/oidc/external/token`)
 
 ```go
@@ -122,6 +124,8 @@ func (a *OIDCAPI) ExternalTokenHandler(ctx *gin.Context) {
     })
 }
 ```
+
+**注意**：原生应用流程中，`popPendingSession` 在最开始执行，一旦通过 state 就被立即消费，后续步骤失败不会残留 state。
 
 ### 2.4 State 校验核心逻辑
 
@@ -192,7 +196,7 @@ func (a *OIDCAPI) createClient(name string, userID uint) (*model.Client, error) 
 |------|------|
 | `Token` | 唯一认证凭证，用于 API 调用 |
 | `UserID` | 关联的用户 ID |
-| `ElevatedUntil` | 会话提升有效期，默认 24 小时 |
+| `ElevatedUntil` | 会话提升有效期，默认 1 小时 |
 | `LastUsed` | 最后使用时间，用于自动续期 Cookie |
 
 ## 5. Cookie 设置与认证流程
@@ -257,14 +261,14 @@ func (a *SessionAPI) Login(ctx *gin.Context) {
 
 | 对比维度 | 本地登录 (`/auth/local/login`) | OIDC 浏览器登录 (`/auth/oidc/callback`) | OIDC 原生应用 (`/auth/oidc/external/token`) |
 |---------|-------------------------------|----------------------------------------|--------------------------------------------|
-| **认证方式** | HTTP Basic Auth (用户名密码) | OIDC Code Flow + UserInfo | OIDC Code Flow + PKCE + UserInfo |
+| **认证方式** | HTTP Basic Auth (用户名密码) | OIDC Code Flow + Userinfo | OIDC Code Flow + PKCE + Userinfo |
 | **State 机制** | 无 | 有，10 分钟有效期，一次性消费 | 有，10 分钟有效期，一次性消费 |
 | **用户存在性** | 必须已存在，验证密码 | 可自动注册（配置项控制） | 可自动注册（配置项控制） |
 | **密码字段** | 必须有，验证 bcrypt 哈希 | `Pass = nil`，无法本地登录 | `Pass = nil`，无法本地登录 |
 | **Client 创建** | 是，走相同 `CreateClient` 逻辑 | 是，走相同 `CreateClient` 逻辑 | 是，走相同 `CreateClient` 逻辑 |
 | **Cookie 设置** | 是，7 天有效期 | 是，7 天有效期 | 否，直接 JSON 返回 Token |
 | **响应格式** | `CurrentUserExternal`（含 user + client 信息） | 307 重定向到首页 | `OIDCExternalTokenResponse`（仅 token + 基础用户信息） |
-| **会话提升** | 登录即默认提升 24 小时 | 登录即默认提升 24 小时，另有独立提升流程 | 登录即默认提升 24 小时 |
+| **会话提升** | 登录即默认提升 1 小时，另有独立提升接口 | 登录即默认提升 1 小时，另有独立 OIDC 提升流程 | 登录即默认提升 1 小时 |
 | **CSRF 防护** | 依赖 SameSite Cookie | State 参数 + SameSite Cookie | State 参数 + PKCE |
 
 ### 6.3 核心相同点
@@ -272,20 +276,20 @@ func (a *SessionAPI) Login(ctx *gin.Context) {
 **三种登录方式最终产生的结果完全一致：**
 1. 都在数据库中创建一条 `Client` 记录
 2. `Client.Token` 生成算法完全相同
-3. `ElevatedUntil` 默认值相同（24 小时）
+3. `ElevatedUntil` 默认值相同（1 小时）
 4. 认证中间件对 Token 的处理逻辑完全一致（不区分登录来源）
 
 ### 6.4 失败路径对比分析
 
 #### 本地登录失败场景
 
-| 失败条件 | HTTP 状态码 | 返回方式 | 是否写 Cookie | 其他影响 |
-|---------|-----------|---------|-------------|---------|
-| 缺少 Basic Auth 头 | 401 | `ctx.AbortWithError`，JSON 错误 | 否 | 无 |
-| 用户不存在 | 401 | `ctx.AbortWithError`，JSON 错误 | 否 | 无 |
-| 密码验证失败 | 401 | `ctx.AbortWithError`，JSON 错误 | 否 | 无 |
-| 缺少 `name` 表单参数 | 400 | Gin 绑定失败，默认错误 | 否 | 无 |
-| Client 创建数据库错误 | 500 | `successOrAbort`，JSON 错误 | 否 | 无 |
+| 失败条件 | HTTP 状态码 | 返回方式 | 是否写 Cookie | 其他影响 | 代码依据 |
+|---------|-----------|---------|-------------|---------|---------|
+| 缺少 Basic Auth 头 | 401 | `ctx.AbortWithError`，JSON 错误 | 否 | 无 | session.go:58-61 |
+| 用户不存在 | 401 | `ctx.AbortWithError`，JSON 错误 | 否 | 无 | session.go:63-70 |
+| 密码验证失败 | 401 | `ctx.AbortWithError`，JSON 错误 | 否 | 无 | session.go:68-70 |
+| 缺少 `name` 表单参数 | 400 | Gin 绑定失败，默认错误 | 否 | 无 | session.go:73-76 |
+| Client 创建数据库错误 | 500 | `successOrAbort`，JSON 错误 | 否 | 无 | session.go:85-87 |
 
 **本地登录失败特点：**
 - 所有失败均返回 JSON 格式错误信息
@@ -294,104 +298,105 @@ func (a *SessionAPI) Login(ctx *gin.Context) {
 
 #### OIDC 浏览器回调失败场景
 
-| 失败条件 | HTTP 状态码 | 返回方式 | 是否写 Cookie | 其他影响 |
-|---------|-----------|---------|-------------|---------|
-| OIDC 令牌交换失败（如 code 无效） | 由 OIDC 库决定 | `http.Error`，纯文本错误 | 否 | `state` 已被 OIDC 库消费（若有） |
-| 用户信息获取失败 | 500 | `http.Error`，纯文本错误 | 否 | `state` 已消费，`pendingSession` 已删除 |
-| 用户名 claim 缺失 | 500 | `http.Error`，纯文本错误 | 否 | 同上 |
-| 用户不存在且自动注册关闭 | 403 | `http.Error`，纯文本错误 | 否 | 同上 |
-| 用户创建数据库错误 | 500 | `http.Error`，纯文本错误 | 否 | 同上 |
-| State 无效或已过期 | 400 | `http.Error`，纯文本错误 | 否 | 无 |
-| Client 创建数据库错误 | 500 | `http.Error`，纯文本错误 | 否 | 用户可能已创建（事务边界问题） |
+| 失败条件 | HTTP 状态码 | 返回方式 | 是否写 Cookie | 其他影响 | 代码依据 |
+|---------|-----------|---------|-------------|---------|---------|
+| OIDC 令牌交换失败（如 code 无效） | 由 OIDC 库决定 | `http.Error`，纯文本错误 | 否 | 执行到回调前失败，`pendingSession` 未消费 | oidc.go:232 |
+| 用户信息获取失败 | 500 | `http.Error`，纯文本错误 | 否 | 执行到回调前失败，`pendingSession` 未消费 | oidc.go:232 |
+| 用户名 claim 缺失 | 500 | `http.Error`，纯文本错误 | 否 | `resolveUser` 失败，`pendingSession` **未消费** | oidc.go:204-208 |
+| 用户不存在且自动注册关闭 | 403 | `http.Error`，纯文本错误 | 否 | `resolveUser` 失败，`pendingSession` **未消费** | oidc.go:204-208 |
+| 用户创建数据库错误 | 500 | `http.Error`，纯文本错误 | 否 | `resolveUser` 失败，`pendingSession` **未消费** | oidc.go:204-208 |
+| State 无效或已过期 | 400 | `http.Error`，纯文本错误 | 否 | **用户可能已创建**（resolveUser 在 popPendingSession 之前），`pendingSession` 未消费 | oidc.go:209-213 |
+| Client 创建数据库错误 | 500 | `http.Error`，纯文本错误 | 否 | 用户已创建，`pendingSession` 已消费 | oidc.go:220-224 |
 
 **OIDC 浏览器回调失败特点：**
 - 所有失败均返回纯文本错误信息（非 JSON）
 - 失败时不会设置 Cookie
-- **重要**：失败发生在不同阶段产生不同副作用：
-  - State 校验失败：无任何副作用
-  - 用户解析失败：`pendingSession` 已删除，需重新发起登录
-  - Client 创建失败：用户可能已创建，`pendingSession` 已删除
+- **重要**：执行顺序导致副作用差异：
+  - `resolveUser` 前失败（令牌交换、用户信息获取）：`pendingSession` 未消费
+  - `resolveUser` 失败：用户未创建，`pendingSession` **未消费**
+  - State 校验失败：**用户可能已创建**，`pendingSession` 未消费
+  - Client 创建失败：用户已创建，`pendingSession` 已消费
 
 #### OIDC 原生应用 Token 交换失败场景
 
-| 失败条件 | HTTP 状态码 | 返回方式 | 是否写 Cookie | 其他影响 |
-|---------|-----------|---------|-------------|---------|
-| 请求参数绑定失败 | 400 | `ctx.AbortWithError`，JSON 错误 | 否 | 无 |
-| State 无效或已过期 | 400 | `ctx.AbortWithError`，JSON 错误 | 否 | 无 |
-| 令牌交换失败（PKCE 验证失败等） | 401 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` 已删除 |
-| 用户信息获取失败 | 500 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` 已删除 |
-| 用户解析失败（同浏览器） | 403/500 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` 已删除 |
-| Client 创建失败 | 500 | `ctx.AbortWithError`，JSON 错误 | 否 | 用户可能已创建 |
+| 失败条件 | HTTP 状态码 | 返回方式 | 是否写 Cookie | 其他影响 | 代码依据 |
+|---------|-----------|---------|-------------|---------|---------|
+| 请求参数绑定失败 | 400 | `ctx.AbortWithError`，JSON 错误 | 否 | 无 | oidc.go:347-350 |
+| State 无效或已过期 | 400 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` 已消费（Pop 操作） | oidc.go:351-355 |
+| 令牌交换失败（PKCE 验证失败等） | 401 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` 已消费 | oidc.go:360-364 |
+| 用户信息获取失败 | 500 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` 已消费 | oidc.go:365-369 |
+| 用户解析失败（同浏览器） | 403/500 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` 已消费，用户可能已创建 | oidc.go:370-374 |
+| Client 创建失败 | 500 | `ctx.AbortWithError`，JSON 错误 | 否 | 用户已创建，`pendingSession` 已消费 | oidc.go:375-379 |
 
 **OIDC 原生应用失败特点：**
 - 所有失败均返回 JSON 格式错误
 - 从不设置 Cookie（该 API 本身就不写 Cookie）
-- 副作用与浏览器回调类似，但响应格式对应用更友好
+- `popPendingSession` 在最开始执行，除了参数绑定失败外，所有后续失败都会导致 `pendingSession` 已消费
+- 用户解析失败时，用户**可能已创建**（如果是新用户且自动注册开启）
 
 ### 6.5 会话提升分支对比
 
 #### 本地登录的会话提升
 
-本地登录**没有独立的提升流程**。会话提升是登录成功后的自然结果：
-- 每次创建新 Client 时自动设置 `ElevatedUntil` 为当前时间 + 24 小时
-- 无法对已有 Client 进行提升（必须重新登录创建新 Client）
+本地登录有**两种**提升机制：
+1. **登录时自动提升**：每次创建新 Client 时自动设置 `ElevatedUntil` 为当前时间 + 1 小时
+2. **独立提升接口**：`POST /client/{id}/elevate` - 可对**已有 Client** 进行提升（需要当前会话已是提升状态）
 
-#### OIDC 的会话提升流程
+#### 两种提升接口详细对比
 
-**提升入口** (`/auth/oidc/elevate`)：
+| 对比项 | `POST /client/{id}/elevate` | `GET /auth/oidc/elevate` |
+|-------|----------------------------|-------------------------|
+| **前置条件** | 需要 `RequireElevatedClient` 中间件（已有提升会话） | 无需已有会话，但需提供 `id`（Client ID）参数 |
+| **路由组** | `clientElevated` 组（router.go:220-227） | 无特殊中间件，与普通 OIDC 登录相同 |
+| **认证方式** | Basic Auth 或 Client Token（必须已提升） | 完整 OIDC 授权码流程（重新登录） |
+| **State 机制** | 无 | 有，完整 state 生命周期 |
+| **是否创建新 Client** | 否，仅更新 `ElevatedUntil` | 否，仅更新 `ElevatedUntil` |
+| **是否设置 Cookie** | 否 | 否 |
+| **是否返回 Token** | 否，返回 204 No Content | 否，返回 HTML 页面提示关闭标签页 |
+| **响应格式** | 204 无内容 | 200 HTML 页面 |
+| **提升时长** | 自定义 `durationSeconds` | 自定义 `durationSeconds` |
+| **典型使用场景** | 已登录用户延长敏感操作的提升有效期 | 会话已过期，通过 OIDC 重新认证来提升 |
+| **代码位置** | client.go:287-312 | oidc.go:160-172, 235-266 |
+
+**`/client/{id}/elevate` 核心逻辑**：
 ```go
-// api/oidc.go:160-172
-func (a *OIDCAPI) ElevateHandler(ctx *gin.Context) {
-    var elevate pendingElevation
-    if err := ctx.BindQuery(&elevate); err != nil {
-        return
-    }
-    state, err := a.generateState()
-    // ...
-    a.pendingSessions.Set(time.Now(), state, &pendingOIDCSession{
-        CreatedAt: time.Now(), 
-        Elevate: &elevate  // 标记为提升会话
+// api/client.go:287-312
+func (a *ClientAPI) ElevateClient(ctx *gin.Context) {
+    withID(ctx, "id", func(id uint) {
+        var params model.ElevateRequest
+        // 绑定参数...
+        
+        // 验证 Client 存在且属于当前用户
+        client, err := a.DB.GetClientByID(id)
+        if client == nil || client.UserID != auth.GetUserID(ctx) {
+            ctx.AbortWithError(404, errors.New("client not found"))
+            return
+        }
+
+        // 仅更新 ElevatedUntil 字段，不创建新 Client
+        elevatedUntil := time.Now().Add(time.Duration(params.DurationSeconds) * time.Second)
+        a.DB.UpdateClientElevatedUntil(client.ID, &elevatedUntil)
+
+        ctx.Status(204)
     })
-    rp.AuthURLHandler(func() string { return state }, a.Provider)(ctx.Writer, ctx.Request)
 }
 ```
 
-**提升回调处理** (`handleElevationCallback`)：
-```go
-// api/oidc.go:235-266
-func (a *OIDCAPI) handleElevationCallback(w http.ResponseWriter, elevate *pendingElevation, user *model.User) {
-    // 1. 验证 Client 存在且属于当前用户
-    client, err := a.DB.GetClientByID(elevate.ClientID)
-    if client == nil || client.UserID != user.ID {
-        http.Error(w, "client not found", http.StatusNotFound)
-        return
-    }
-    
-    // 2. 更新提升过期时间（不创建新 Client）
-    elevatedUntil := time.Now().Add(time.Duration(elevate.DurationSeconds) * time.Second)
-    if err := a.DB.UpdateClientElevatedUntil(client.ID, &elevatedUntil); err != nil {
-        http.Error(w, fmt.Sprintf("failed to elevate session: %v", err), http.StatusInternalServerError)
-        return
-    }
-    
-    // 3. 返回成功页面（不设置 Cookie，不返回 Token）
-    w.WriteHeader(http.StatusOK)
-    w.Header().Add("content-type", "text/html")
-    io.WriteString(w, `... 提升成功页面 ...`)
-}
-```
+**两种提升方式的本质区别**：
+- `/client/{id}/elevate` 是**"用提升会话来续期"** - 鸡生蛋
+- `/auth/oidc/elevate` 是**"用重新认证来获得提升"** - 蛋生鸡
 
-#### 会话提升对比表
+### 6.6 会话提升失败路径对比
 
-| 对比项 | 本地登录提升 | OIDC 提升流程 |
-|-------|------------|--------------|
-| **流程性质** | 登录副作用，无独立流程 | 独立完整的 OIDC 授权流程 |
-| **是否创建新 Client** | 是（每次登录都创建） | 否（仅更新已有 Client 的 `ElevatedUntil`） |
-| **是否设置 Cookie** | 是（新 Client Token） | 否（复用已有 Cookie） |
-| **是否返回 Token** | 是（在 JSON 响应中） | 否（仅返回 HTML 提示页面） |
-| **提升时长** | 固定 24 小时 | 可自定义 `durationSeconds` |
-| **前置条件** | 用户名密码 | 已有有效 Client + OIDC 重新认证 |
-| **State 机制** | 无 | 有（完整的 state 生命周期） |
+| 失败条件 | `/client/{id}/elevate` | `/auth/oidc/elevate`（回调阶段） |
+|---------|-----------------------|--------------------------------|
+| 未认证或认证无效 | 401 中间件拦截 | 401 中间件拦截（OIDC 流程外） |
+| 会话未提升 | 403 "session not elevated" | 不适用（走完整 OIDC 流程） |
+| Client ID 无效 | 404 "client not found" | 404 "client not found"（oidc.go:241-243） |
+| Client 不属于当前用户 | 404 "client not found" | 404 "client not found"（oidc.go:241-243） |
+| 数据库查询错误 | 500 | 500 "database error"（oidc.go:237-239） |
+| 数据库更新错误 | 500 | 500 "failed to elevate session"（oidc.go:246-248） |
+| `pendingSession` 中 `Elevate` 为空 | 不适用 | 不会发生（入口已设置 Elevate 信息） |
 
 ## 7. 登出流程
 
@@ -433,6 +438,8 @@ func (a *SessionAPI) Logout(ctx *gin.Context) {
 
 6. **Token 随机生成**：确保不可预测性
 
-7. **自动过期机制**：State 10 分钟，Cookie 7 天，提升会话 24 小时
+7. **自动过期机制**：State 10 分钟，Cookie 7 天，提升会话默认 1 小时
 
-8. **会话提升隔离**：提升流程独立于登录流程，仅更新权限不创建新会话
+8. **会话提升隔离**：提供两种独立的提升机制应对不同场景
+   - `/client/{id}/elevate`：已提升会话续期
+   - `/auth/oidc/elevate`：通过重新认证获得提升
