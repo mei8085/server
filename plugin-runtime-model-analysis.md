@@ -195,21 +195,46 @@ messages: make(chan MessageWithUserID)  // 无缓冲！容量=0
 
 ### 4.3 失败边界的精确刻画
 
-**失败场景与数据丢失情况**：
+**核心代码行为确认** (`plugin/manager.go:80-82`):
+```go
+db.CreateMessage(internalMsg)          // 无错误检查，静默失败
+message.Message.ID = internalMsg.ID    // Gorm Create会回填自增ID到internalMsg
+notifier.Notify(message.UserID, &message.Message)  // 无论DB成败，都执行推送
+```
+
+> **关键事实**：`db.CreateMessage` 没有任何错误检查，也没有返回值判断。
+> 无论数据库写入成功还是失败，代码都会**无条件继续**执行 `notifier.Notify`。
+
+**DB写入失败后的消息去向辨析**：
+
+| 场景 | ID字段状态 | 在线客户端 | 离线客户端 | 消息去向分类 |
+|------|-----------|-----------|-----------|------------|
+| ✅ DB写入成功 | = 真实自增ID | ✅ 收到带ID消息 | ✅ 可通过 `/message` 拉取 | 已持久化 |
+| ❌ DB写入失败 | = 0 (Gorm初始值) | ✅ 收到 `id=0` 的消息 | ❌ 无法从历史消息拉取 | 未持久化 + 在线瞬传 |
+
+**"丢失" vs "未持久化" 边界定义**：
+
+| 概念 | 定义 | 对应场景 |
+|------|------|---------|
+| **丢失** | 消息从未到达任何客户端，也无持久化副本 | 1. channel写入前失败<br>2. 服务重启时channel中消息<br>3. DB写入成功但推送时所有客户端都离线且永不重连 |
+| **未持久化** | 消息送达了在线客户端，但无法从历史消息中检索 | DB写入失败后 Notify 仍成功的"瞬态消息" |
+
+**完整失败矩阵**：
 
 | 失败点 | 是否持久化 | 消息状态 | 可恢复性 | 日志记录 |
 |-------|-----------|---------|---------|---------|
 | channel写入前 | 否 | 完全丢失 | 不可恢复 | 无 |
-| DB写入失败 | 否 | 完全丢失 | 不可恢复 | 仅Gorm内部日志 |
+| **DB写入失败** | ❌ 否 | **在线客户端收到(id=0)，离线丢失** | **仅在线瞬传** | 仅Gorm内部日志 |
 | WebSocket推送失败 | ✅ 已持久化 | 离线客户端可拉取 | 离线可恢复 | 仅stream内部日志 |
 | 服务重启 channel中消息 | 否 | 完全丢失 | 不可恢复 | 无 |
 
-**静默失败点** (`plugin/manager.go:78`):
+**静默失败点汇总** (`plugin/manager.go:78,80`):
 ```go
-if message.Message.Extras != nil {
-    internalMsg.Extras, _ = json.Marshal(message.Message.Extras)
-    // 注意：_ 忽略错误，Extras序列化失败静默继续
-}
+// 静默失败1: Extras序列化错误被忽略
+internalMsg.Extras, _ = json.Marshal(message.Message.Extras)
+
+// 静默失败2: 数据库写入错误被忽略，继续推送
+db.CreateMessage(internalMsg)  // err == nil 不检查
 ```
 
 ---
