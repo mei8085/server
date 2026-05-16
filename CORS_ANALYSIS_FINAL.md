@@ -1,12 +1,14 @@
-# 反向代理场景下跨域请求处理策略分析报告（最终版）
+# 反向代理场景下跨域请求处理策略分析报告（最终版 - 含令牌来源闭环）
 
 ## 目录
 1. [关键代码证据索引（经复核）](#1-关键代码证据索引经复核)
 2. [跨域规则的配置来源与加载路径](#2-跨域规则的配置来源与加载路径)
 3. [WebSocket 浏览器侧认证限制分析](#3-websocket-浏览器侧认证限制分析)
 4. [跨域凭据链路深度分析](#4-跨域凭据链路深度分析)
-5. [三场景鉴权矩阵（HTTP vs WebSocket）](#5-三场景鉴权矩阵http-vs-websocket)
-6. [可落地部署方案与风险评估](#6-可落地部署方案与风险评估)
+5. [令牌来源闭环分析](#5-令牌来源闭环分析)
+6. [完全跨域场景下可执行的令牌生命周期](#6-完全跨域场景下可执行的令牌生命周期)
+7. [最终方案矩阵（HTTP API / WebSocket 分开）](#7-最终方案矩阵http-api--websocket-分开)
+8. [可落地部署方案与风险评估](#8-可落地部署方案与风险评估)
 
 ---
 
@@ -19,13 +21,13 @@
 | 前端自动构造同源 URL | `ui/src/index.tsx` | 第 20-26 行 | ✅ 已复核 |
 | WebSocket URL 从同源 URL 派生 | `ui/src/message/WebSocketStore.ts` | 第 22 行 | ✅ 已复核 |
 | Cookie 使用 SameSite=Strict | `auth/cookie.go` | 第 20 行 | ✅ 已复核 |
-| Cookie 名称常量 | `auth/cookie.go` | 第 10 行 | ✅ 已复核 |
+| CurrentUserExternal 不含 Token | `model/user.go` | 第 88-113 行 | ✅ 已复核 |
+| `/auth/local/login` 只通过 Cookie 发 Token | `api/session.go` | 第 89-97 行 | ✅ 已复核 |
+| `POST /client` 返回包含 Token 的 Client | `api/client.go` | 第 154 行 | ✅ 已复核 |
 | CORS 中间件全局挂载 | `router/router.go` | 第 131 行 | ✅ 已复核 |
-| CORS 配置未设置 AllowCredentials | `auth/cors.go` | 第 15-18 行 | ✅ 已复核 |
+| CORS 未配置 AllowCredentials | `auth/cors.go` | 第 15-18 行 | ✅ 已复核 |
 | Token 读取优先级 | `auth/authentication.go` | 第 205-216 行 | ✅ 已复核 |
 | axios 未设置 withCredentials | `ui/src/CurrentUser.ts` | 第 52-53 行 | ✅ 已复核 |
-| 前端登出逻辑（401 触发） | `ui/src/CurrentUser.ts` | 第 109-110 行 | ✅ 已复核 |
-| 配置文件路径 | `config/config.go` | 第 71-76 行 | ✅ 已复核 |
 
 ---
 
@@ -39,21 +41,11 @@
 - **配置格式**：YAML 格式
 
 **代码证据**：`config/config.go:71-76`
-```go
-func configFiles() []string {
-    if mode.Get() == mode.TestDev {
-        return []string{"config.yml"}
-    }
-    return []string{"config.yml", "/etc/gotify/config.yml"}
-}
-```
 
 #### 2.1.2 环境变量
 - **前缀**：`GOTIFY_`
 - **配置加载库**：`github.com/jinzhu/configor`
 - **优先级**：环境变量 > 配置文件
-
-**代码证据**：`config/config.go:78-87`
 
 ### 2.2 CORS 相关配置项
 
@@ -84,25 +76,9 @@ server:
     allowedorigins:     # ⚠️ 只匹配 hostname，正则不要包含协议或端口
       - "^my-app\\.com$"           # 匹配精确域名
       - "^.+\\.my-app\\.com$"      # 匹配所有子域名
-      - "^192\\.168\\.1\\.100$"    # 匹配精确 IP 地址
 ```
 
 **代码证据**：`api/stream/stream.go:187-209`
-```go
-func isAllowedOrigin(r *http.Request, allowedOrigins []*regexp.Regexp) bool {
-    origin := r.Header.Get("origin")
-    // ...
-    u, err := url.Parse(origin)
-    // ...
-    for _, allowedOrigin := range allowedOrigins {
-        // ⚠️ 关键：第 203 行，只匹配 u.Hostname()，不是完整 Origin URL
-        if allowedOrigin.MatchString(strings.ToLower(u.Hostname())) {
-            return true
-        }
-    }
-    return false
-}
-```
 
 **匹配示例（可直接生效）**：
 
@@ -110,30 +86,7 @@ func isAllowedOrigin(r *http.Request, allowedOrigins []*regexp.Regexp) bool {
 |----------------|-----------|----------------|------|
 | `https://app.example.com` | `^app\.example\.com$` | `app.example.com` | ✅ 匹配 |
 | `https://app.example.com:8443` | `^app\.example\.com$` | `app.example.com` | ✅ 匹配（端口被忽略） |
-| `https://sub.app.example.com` | `^.+\.app\.example\.com$` | `sub.app.example.com` | ✅ 匹配 |
 | `http://localhost:3000` | `^localhost$` | `localhost` | ✅ 匹配 |
-
-**常见错误配置（不生效）**：
-- ❌ `^https?://my-app\.com$` → 包含协议，永远不匹配
-- ❌ `^my-app\.com:8443$` → 包含端口，永远不匹配
-
-#### 2.2.3 WebSocket CheckOrigin 调用链
-**代码证据**：`api/stream/stream.go:211-223`
-```go
-func newUpgrader(allowedWebSocketOrigins []string) *websocket.Upgrader {
-    compiledAllowedOrigins := compileAllowedWebSocketOrigins(allowedWebSocketOrigins)
-    return &websocket.Upgrader{
-        ReadBufferSize:  1024,
-        WriteBufferSize: 1024,
-        CheckOrigin: func(r *http.Request) bool {
-            if mode.IsDev() {
-                return true
-            }
-            return isAllowedOrigin(r, compiledAllowedOrigins)
-        },
-    }
-}
-```
 
 ---
 
@@ -152,10 +105,6 @@ const ws = new WebSocket(url, protocols);
 ```
 
 **代码证据**：`ui/src/message/WebSocketStore.ts:22` - 前端未也无法设置 WebSocket 请求头
-```typescript
-const wsUrl = config.get('url').replace('http', 'ws').replace('https', 'wss');
-const ws = new WebSocket(wsUrl + 'stream');  // ⚠️ 无法设置自定义请求头
-```
 
 ### 3.2 Gotify WebSocket 认证机制
 
@@ -165,12 +114,7 @@ const ws = new WebSocket(wsUrl + 'stream');  // ⚠️ 无法设置自定义请�
 func (a *API) Handle(ctx *gin.Context) {
     // 第 144 行：先做 Upgrade，此时已应用 CORS 检查
     conn, err := a.upgrader.Upgrade(ctx.Writer, ctx.Request, nil)
-    if err != nil {
-        ctx.Error(err)
-        return
-    }
-
-    var token string
+    // ...
     // 第 151-153 行：从 Gin Context 获取已认证的客户端（来自中间件）
     if c := auth.GetClient(ctx); c != nil {
         token = c.Token
@@ -192,7 +136,7 @@ func (a *API) Handle(ctx *gin.Context) {
 | **Basic Auth** | ✅ 是 | ⚠️ 极少用 | ⚠️ 需 URL 编码 | 浏览器不支持直接设置 |
 
 **关键结论**：
-> ✅ **完全跨域场景下，X-Gotify-Key 仅适用于 HTTP API，WebSocket 必须依赖 Cookie 或 query token**
+> ✅ **完全跨域场景下，X-Gotify-Key 仅适用于 HTTP API，WebSocket 必须依赖 Cookie 或 Query Token**
 
 ---
 
@@ -207,12 +151,7 @@ func (a *API) Handle(ctx *gin.Context) {
 ```typescript
 axios
     .create()  // ⚠️ 第 53 行：使用默认配置，withCredentials = false
-    .request({
-        url: config.get('url') + 'auth/local/login',
-        method: 'POST',
-        data: {name},
-        headers: {Authorization: 'Basic ' + btoa(username + ':' + password)},
-    })
+    .request({...})
 ```
 
 **axios 默认行为说明**：
@@ -303,219 +242,217 @@ func CorsConfig(conf *config.Configuration) cors.Config {
 
 ---
 
-## 5. 三场景鉴权矩阵（HTTP vs WebSocket）
+## 5. 令牌来源闭环分析
 
-### 5.1 三种部署场景定义
+### 5.1 登录接口返回结构核查
+
+⚠️ **核心发现（关键证据）**：`/auth/local/login` 响应体**只包含 CurrentUserExternal，不返回 client token**
+
+**CurrentUserExternal 结构定义**：
+**代码证据**：`model/user.go:88-113`
+```go
+type CurrentUserExternal struct {
+    ID             uint        `json:"id"`              // 用户 ID
+    Name           string      `json:"name"`            // 用户名
+    Admin          bool        `json:"admin"`           // 是否管理员
+    ClientID       uint        `json:"clientId,omitempty"`  // ⚠️ 只有 client ID，没有 token！
+    ElevatedUntil *time.Time `json:"elevatedUntil,omitempty"`
+}
+```
+
+**登录接口实际返回流程**：
+**代码证据**：`api/session.go:89-97`
+```go
+auth.SetCookie(ctx.Writer, client.Token, auth.CookieMaxAge, a.SecureCookie)
+
+ctx.JSON(200, &model.CurrentUserExternal{
+    ID:            user.ID,
+    Name:          user.Name,
+    Admin:         user.Admin,
+    ClientID:      client.ID,  // ⚠️ 只返回 ID，不返回 token！
+    ElevatedUntil: client.ElevatedUntil,
+})
+```
+
+**关键结论**：
+> Token 只通过 `Set-Cookie` 响应头返回给浏览器，**永远不会出现在响应体中**
+> 完全跨域场景下，由于 Cookie 被浏览器拦截，前端**无法获取到任何 token**
+
+### 5.2 对 "Header+Query 混合认证" 方案的直接影响
+
+| 影响项 | 分析结果 |
+|-------|---------|
+| **令牌来源缺失** | ❌ 登录接口不返回 token，前端无法获取用于 Header 认证的 token |
+| **引导问题** | ❌ 首次登录后，前端没有 token 可以设置到 X-Gotify-Key 请求头 |
+| **方案可行性** | ❌ 「Header+Query 混合认证」在当前代码下**无法直接落地**，必须修改 |
+| **根本原因** | 认证体系设计上假设了同域 Cookie 总是可用，未考虑完全跨域场景 |
+
+---
+
+## 6. 完全跨域场景下可执行的令牌生命周期
+
+### 6.1 令牌获取路径（3 种可行方案）
+
+#### 方案 A：修改登录接口返回 Token（需要后端改动）
+
+**路径**：`POST /auth/local/login` → 返回体新增 token 字段
+
+**前置条件**：
+- 配置 `server.cors.alloworigins` 包含前端域名
+- 配置 `server.cors.allowheaders` 包含 `Authorization`
+
+**安全风险**：
+- ⚠️ Token 暴露在响应体中，增加 XSS 窃取风险
+- ⚠️ 需要考虑响应加密或只返回一次
+
+**落地状态**：🔧 需要改动后可落地
+
+---
+
+#### 方案 B：通过 Basic Auth 调用 POST /client 创建新客户端（当前代码可复用）
+
+**代码证据**：`api/client.go:154` - CreateClient 返回完整 Client 对象（包含 Token）
+
+**路径**：
+1. 前端使用 Basic Auth 调用 `POST /client` 创建新客户端
+2. 响应体中包含完整 Client 对象，其中有 Token 字段
+3. 将 Token 存储到 localStorage
+
+**前置条件**：
+- 配置 `server.cors.alloworigins` 包含前端域名
+- 配置 `server.cors.allowheaders` 包含 `Authorization`
+- 用户知道自己的账号密码（首次登录时）
+
+**安全风险**：
+- ⚠️ 需要让用户输入密码并存储在前端内存中
+- ⚠️ 每次创建新客户端都会产生新 token
+- ⚠️ 会产生大量客户端记录
+
+**落地状态**：✅ 当前代码可直接落地（但体验较差）
+
+---
+
+#### 方案 C：启用跨域 Cookie（需要前后端 3 处改动）
+
+**路径**：
+1. 前端设置 `axios.defaults.withCredentials = true`
+2. 后端设置 CORS `AllowCredentials = true`
+3. 后端设置 Cookie `SameSite = None`（配合 Secure=true）
+4. 登录后 Token 通过 Cookie 自动传输
+
+**前置条件**：
+- 必须 HTTPS（SameSite=None 要求 Secure=true）
+- 配置 `server.cors.alloworigins`（不能用通配符）
+- 配置 `server.securecookie: true`
+
+**安全风险**：
+- ⚠️ SameSite=None 降低 CSRF 防护
+- ⚠️ 依赖浏览器第三方 Cookie 政策（可能被用户禁用）
+- ⚠️ 需要精确配置 Origin，不能用 `*`
+
+**落地状态**：🔧 需要改动后可落地
+
+---
+
+### 6.2 令牌续期路径
+
+#### 当前续期机制（基于 Cookie）
+服务端在收到有效 token 后会自动刷新 Cookie 有效期
+
+**代码证据**：`auth/authentication.go:158-166`
+```go
+now := timeNow()
+if client.LastUsed == nil || client.LastUsed.Add(5*time.Minute).Before(now) {
+    if err := a.DB.UpdateClientTokensLastUsed([]string{client.Token}, &now); err != nil {
+        // ...
+    }
+    if isCookie {
+        SetCookie(ctx.Writer, client.Token, CookieMaxAge, a.SecureCookie)
+    }
+}
+```
+
+**跨域场景续期方案**：
+
+| 认证方式 | 续期机制 | 可行性 |
+|---------|---------|-------|
+| **Cookie 方案 C** | Cookie 自动续期 | ✅ 可用（需 withCredentials=true） |
+| **Header/Query 方案 A/B** | 需要前端主动调用续期接口 | 🔧 需要新增接口 |
+
+### 6.3 令牌撤销路径
+
+**当前撤销接口**：
+- `POST /auth/logout` - 删除当前客户端（基于 Cookie 认证）
+  **代码证据**：`api/session.go:123-138`
+- `DELETE /client/{id}` - 删除指定客户端（需 elevated 权限）
+  **代码证据**：`api/client.go:197-243`
+
+**跨域场景下的撤销**：
+
+| 认证方式 | 可用接口 | 注意事项 |
+|---------|---------|---------|
+| **Cookie 方案 C** | `POST /auth/logout` | ✅ 正常工作 |
+| **Header/Query 方案 A/B** | `DELETE /client/{id}` | ⚠️ 需要额外管理 client ID |
+
+---
+
+## 7. 最终方案矩阵（HTTP API / WebSocket 分开）
+
+### 7.1 三种部署场景定义
 
 | 场景代号 | 部署方式 | 域名示例 | 浏览器同源判定 |
 |---------|---------|---------|--------------|
 | A | 同域部署 | UI + API + WS: `https://gotify.example.com/` | ✅ 同源 |
-| B | 反代同域 | UI: `https://app.example.com/`<br>通过 Nginx 转发 API/Ws 到内网 Gotify | ✅ 浏览器认为同源 |
+| B | 反代同域 | UI: `https://app.example.com/`<br>通过 Nginx 转发 API/WS 到内网 Gotify | ✅ 浏览器认为同源 |
 | C | 完全跨域 | UI: `https://my-dashboard.com/`<br>API: `https://gotify.other.com/` | ❌ 完全跨域 |
 
-### 5.2 HTTP API 鉴权矩阵
+### 7.2 HTTP API 认证方案矩阵
 
-| 认证方案 | 场景 A（同域） | 场景 B（反代同域） | 场景 C（完全跨域） | 需修改代码 |
-|---------|-------------|-----------------|-----------------|-----------|
-| **Cookie（默认）** | ✅ **原生支持** | ✅ **原生支持** | ❌ **完全不可用** | 否 |
-| **X-Gotify-Key Header** | ✅ 支持 | ✅ 支持 | ✅ **推荐方案** | ✅ 前端需拦截器 |
-| **Authorization Bearer** | ✅ 支持 | ✅ 支持 | ✅ **推荐方案** | ✅ 前端需拦截器 |
-| **Query Token** | ✅ 支持 | ✅ 支持 | ⚠️ 支持但不推荐 | ✅ 前端需处理 |
+| 认证方案 | 场景 A（同域） | 场景 B（反代同域） | 场景 C（完全跨域） | 落地状态 | 需修改 |
+|---------|-------------|-----------------|-----------------|---------|-------|
+| **Cookie（默认）** | ✅ 原生支持 | ✅ 原生支持 | ❌ 不可用 | ✅ 场景 A/B<br>❌ 场景 C | 场景 C 需 3 处修改 |
+| **X-Gotify-Key Header** | ⚠️ 技术可但无 token 来源 | ⚠️ 技术可但无 token 来源 | ⚠️ 需先解决 token 来源 | 🔧 需解决 token 获取 | 需新增/修改登录接口 |
+| **Authorization Bearer** | ⚠️ 技术可但无 token 来源 | ⚠️ 技术可但无 token 来源 | ⚠️ 需先解决 token 来源 | 🔧 需解决 token 获取 | 需新增/修改登录接口 |
+| **Query Token** | ✅ 支持 | ✅ 支持 | ✅ 支持（需 token 获取） | 🔧 需解决 token 获取 | 前端需拼接 URL |
+| **Basic Auth** | ✅ 支持（仅首次） | ✅ 支持（仅首次） | ✅ 支持（仅首次） | ✅ 当前代码可直接落地（仅首次认证） | 用户需每次输入密码 |
 
-### 5.3 WebSocket 鉴权矩阵
+### 7.3 WebSocket 认证方案矩阵
 
-| 认证方案 | 场景 A（同域） | 场景 B（反代同域） | 场景 C（完全跨域） | 需修改代码 |
-|---------|-------------|-----------------|-----------------|-----------|
-| **Cookie（默认）** | ✅ **原生支持** | ✅ **原生支持** | ❌ **完全不可用** | 否 |
-| **X-Gotify-Key Header** | ❌ 不可用 | ❌ 不可用 | ❌ 不可用 | - |
-| **Authorization Bearer** | ❌ 不可用 | ❌ 不可用 | ❌ 不可用 | - |
-| **Query Token (`?token=xxx`)** | ✅ 支持 | ✅ 支持 | ✅ **唯一可行方案** | ✅ 前端需拼接 URL |
+| 认证方案 | 场景 A（同域） | 场景 B（反代同域） | 场景 C（完全跨域） | 落地状态 | 需修改 |
+|---------|-------------|-----------------|-----------------|---------|-------|
+| **Cookie（默认）** | ✅ 原生支持 | ✅ 原生支持 | ❌ 不可用 | ✅ 场景 A/B<br>❌ 场景 C | 场景 C 需 3 处修改 |
+| **X-Gotify-Key Header** | ❌ 不可用 | ❌ 不可用 | ❌ 不可用 | ❌ 不可落地 | 浏览器不支持 |
+| **Authorization Bearer** | ❌ 不可用 | ❌ 不可用 | ❌ 不可用 | ❌ 不可落地 | 浏览器不支持 |
+| **Query Token (`?token=xxx`)** | ✅ 支持 | ✅ 支持 | ✅ 唯一可行方案 | 🔧 需解决 token 获取 | 前端需拼接 URL |
+| **Basic Auth** | ❌ 不可用 | ❌ 不可用 | ❌ 不可用 | ❌ 不可落地 | WebSocket 构造函数不支持 |
 
-### 5.4 各场景详细鉴权链路
+### 7.4 完全跨域场景推荐组合方案
 
-#### 5.4.1 场景 A：同域部署（推荐默认方案）
+#### 推荐组合：Basic Auth 获取 Token + Header + Query 混合
 
-**HTTP API 链路**：
-1. ✅ URL 自动构造为同源（第 20-26 行）
-2. ✅ Cookie SameSite=Strict 在同域正常工作（第 20 行）
-3. ✅ axios.withCredentials=false 在同域不影响 Cookie 发送
-4. ✅ 无需 CORS 配置
+| 阶段 | 操作 | 认证方式 | 说明 |
+|------|------|---------|------|
+| **首次登录** | `POST /client` + Basic Auth | Basic Auth | 获取 token 存入 localStorage |
+| **HTTP API** | 所有请求加 `X-Gotify-Key` Header | Header 认证 | 所有 API 调用 |
+| **WebSocket** | `new WebSocket(url + '?token=xxx')` | Query Token | 消息流连接 |
 
-**WebSocket 链路**：
-1. ✅ 同源请求，CheckOrigin 直接通过（第 198-200 行）
-2. ✅ Cookie 正常发送，服务端认证成功
-3. ✅ 无需配置 stream.allowedorigins
-
-**配置清单**：
-```yaml
-# config.yml - 无需额外 CORS 配置
-server:
-  securecookie: true  # HTTPS 环境必须启用
-  # cors.alloworigins - 无需配置
-  # stream.allowedorigins - 无需配置
-```
-
-**验证步骤**：
-1. 访问 `https://gotify.example.com/`
-2. 登录检查 Cookie：`Application → Cookies → gotify-client-token`
-3. 刷新页面，确认保持登录状态
-4. 检查 Network → WS → Headers，确认连接建立成功
+**落地状态**：✅ 当前代码可直接落地（但需前端大量修改）
 
 ---
 
-#### 5.4.2 场景 B：反代同域部署（生产环境推荐）
+## 8. 可落地部署方案与风险评估
 
-**核心原理**：通过 Nginx 反向代理让浏览器认为 UI 和 API 同域
+### 8.1 方案优先级推荐
 
-**Nginx 反向代理配置**：
-```nginx
-server {
-    listen 443 ssl;
-    server_name app.example.com;
+| 优先级 | 方案 | 适用场景 | HTTP API 落地状态 | WebSocket 落地状态 | 总改动量 |
+|-------|------|---------|-----------------|-------------------|---------|
+| 1 | **同域部署** | 新项目、域名可控 | ✅ 当前代码可直接落地 | ✅ 当前代码可直接落地 | 0 |
+| 2 | **反代同域** | 已有域名、可配置 Nginx | ✅ 当前代码可直接落地 | ✅ 当前代码可直接落地 | 仅运维配置 |
+| 3 | **启用跨域 Cookie** | 必须完全跨域、不想改认证逻辑 | 🔧 需要改动后可落地 | 🔧 需要改动后可落地 | 前端 + 后端 3 处 |
+| 4 | **Basic Auth 获取 + Header + Query 混合** | 必须完全跨域、不能改 Cookie | 🔧 需要改动后可落地 | 🔧 需要改动后可落地 | 前端大量修改 |
+| 5 | **修改登录接口返回 Token** | 必须完全跨域、追求最佳体验 | 🔧 需要改动后可落地 | 🔧 需要改动后可落地 | 前端 + 后端 |
 
-    # 前端静态资源（或另一个 upstream）
-    location / {
-        root /var/www/dashboard;
-        try_files $uri $uri/ /index.html;
-    }
-
-    # Gotify API 转发 - 保持同域路径
-    location /gotify/ {
-        proxy_pass http://gotify-internal:8080/;
-        
-        # 保留原始 Host
-        proxy_set_header Host $host;
-        
-        # 转发真实 IP
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        
-        # WebSocket 支持
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
-}
-```
-
-**Gotify 配置**：
-```yaml
-server:
-  trustedproxies:
-    - 192.168.1.10/32  # Nginx 服务器 IP
-  securecookie: true
-  # CORS 无需配置 - 浏览器认为是同域
-```
-
-**HTTP API 链路**：
-1. ✅ 浏览器认为是同域（相同 protocol://host:port）
-2. ✅ Cookie 正常发送（SameSite=Strict 在同域生效）
-3. ✅ 无需 CORS 配置
-4. ✅ 无需修改前端代码
-
-**WebSocket 链路**：
-1. ✅ 浏览器认为是同源，CheckOrigin 直接通过
-2. ✅ Cookie 正常发送，服务端认证成功
-3. ✅ 无需配置 stream.allowedorigins
-
----
-
-#### 5.4.3 场景 C：完全跨域部署（需代码修改）
-
-⚠️ **重要**：此场景下 WebSocket 无法使用 Header 认证，必须用 Cookie 或 Query Token
-
-**方案 1：启用跨域 Cookie（需 3 处修改 + 1 处配置）**
-
-**修改 1/4：前端 axios 配置**
-```typescript
-// ui/src/index.tsx 或全局初始化位置
-axios.defaults.withCredentials = true;
-```
-
-**修改 2/4：服务端 CORS 配置**
-```go
-// auth/cors.go:14-18
-func CorsConfig(conf *config.Configuration) cors.Config {
-    corsConf := cors.Config{
-        MaxAge:                 12 * time.Hour,
-        AllowBrowserExtensions: true,
-        AllowCredentials:       true,  // ✅ 新增：允许跨域凭据
-    }
-    // ...
-}
-```
-
-**修改 3/4：Cookie SameSite 属性**
-```go
-// auth/cookie.go:12-21
-func SetCookie(w http.ResponseWriter, token string, maxAge int, secure bool) {
-    // 跨域场景需要 SameSite=None
-    // 注意：SameSite=None 必须配合 Secure=true
-    sameSite := http.SameSiteNoneMode
-    
-    http.SetCookie(w, &http.Cookie{
-        Name:     CookieName,
-        Value:    token,
-        Path:     "/",
-        MaxAge:   maxAge,
-        Secure:   secure,  // 必须为 true
-        HttpOnly: true,
-        SameSite: sameSite,
-    })
-}
-```
-
-**修改 4/4：WebSocket Origin 白名单配置**
-```yaml
-server:
-  stream:
-    allowedorigins:
-      - "^my-dashboard\\.com$"  # ⚠️ 只匹配 hostname
-```
-
-**方案 2：Header + Query Token 混合认证（推荐，改动最小）**
-
-**前端修改（HTTP API 拦截器）**：
-```typescript
-// 添加 axios 请求拦截器
-axios.interceptors.request.use(config => {
-    const token = localStorage.getItem('gotify-token');
-    if (token) {
-        config.headers['X-Gotify-Key'] = token;  // ✅ HTTP API 使用 Header
-    }
-    return config;
-});
-
-// WebSocketStore 中修改 WebSocket 连接
-const ws = new WebSocket(wsUrl + 'stream?token=' + token);  // ✅ WebSocket 使用 Query Token
-```
-
-**优点**：
-- ✅ 不受 SameSite 限制
-- ✅ 无需修改 Cookie 配置
-- ✅ 无需修改服务端 CORS AllowCredentials（但仍需配置 allowOrigins）
-- ✅ 改动集中在前端
-
-**缺点**：
-- ❌ Token 暴露在 WebSocket URL 中（可能出现在日志）
-- ❌ Token 存储在 localStorage（XSS 风险，虽然后端还有 HttpOnly）
-- ❌ 会话续期需要手动处理
-
----
-
-## 6. 可落地部署方案与风险评估
-
-### 6.1 方案优先级推荐
-
-| 优先级 | 方案 | 适用场景 | 改动量 | 风险 |
-|-------|------|---------|-------|------|
-| 1 | **同域部署** | 新项目、域名可控 | 无 | 最低 |
-| 2 | **反代同域** | 已有域名、可配置 Nginx | 仅运维配置 | 低 |
-| 3 | **Header+Query 混合认证** | 必须完全跨域 | 前端修改 | 中 |
-| 4 | **跨域 Cookie** | 必须完全跨域、不想改前端逻辑 | 前端 + 后端 | 高 |
-
-### 6.2 完全跨域场景完整配置参考
+### 8.2 完全跨域场景完整配置参考
 
 ```yaml
 server:
@@ -545,44 +482,44 @@ server:
     - 192.168.1.10/32  # 明确列出可信代理
 ```
 
-### 6.3 风险评估矩阵
+### 8.3 风险评估矩阵
 
-| 风险点 | 同域部署 | 反代同域 | 混合认证 | 跨域 Cookie |
-|--------|---------|---------|---------|-----------|
-| CSRF 攻击 | ✅ 低（SameSite=Strict） | ✅ 低 | ⚠️ 中（无 SameSite 保护） | ❌ 高（SameSite=None） |
-| XSS 攻击 | ✅ 低（HttpOnly Cookie） | ✅ 低 | ⚠️ 中（localStorage） | ✅ 低 |
-| 令牌泄露 | ✅ 低 | ✅ 低 | ⚠️ 中（URL 日志） | ✅ 低 |
-| 浏览器兼容性 | ✅ 高 | ✅ 高 | ✅ 高 | ⚠️ 中（SameSite=None 支持） |
-| 维护成本 | ✅ 低 | ✅ 低 | ⚠️ 中 | ❌ 高 |
+| 风险点 | 同域部署 | 反代同域 | 跨域 Cookie | Header+Query 混合 |
+|--------|---------|---------|------------|-----------------|
+| CSRF 攻击 | ✅ 低（SameSite=Strict） | ✅ 低 | ❌ 高（SameSite=None） | ⚠️ 中（无 SameSite 保护） |
+| XSS 攻击 | ✅ 低（HttpOnly Cookie） | ✅ 低 | ✅ 低 | ⚠️ 中（localStorage） |
+| 令牌泄露 | ✅ 低 | ✅ 低 | ✅ 低 | ⚠️ 中（URL 日志） |
+| 浏览器兼容性 | ✅ 高 | ✅ 高 | ⚠️ 中（SameSite=None 支持） | ✅ 高 |
+| 维护成本 | ✅ 低 | ✅ 低 | ❌ 高 | ❌ 高（大量前端逻辑） |
+| 首次登录体验 | ✅ 好 | ✅ 好 | ✅ 好 | ⚠️ 差（需额外 API 调用） |
 
 ---
 
-## 总结
+## 总结（最终版）
 
 ### 核心发现（经代码复核）
-1. **WebSocket Hostname 匹配**：`server.stream.allowedorigins` 正则**只匹配 Origin 的 hostname 部分**（`api/stream/stream.go:203`），不要包含协议或端口
-2. **前端同源策略**：UI 基于 `window.location` 自动构造同源 URL（`ui/src/index.tsx:20-26`），默认不会跨域调用
+1. **WebSocket Hostname 匹配**：`server.stream.allowedorigins` 正则**只匹配 Origin 的 hostname 部分**（`api/stream/stream.go:203`）
+2. **前端同源策略**：UI 基于 `window.location` 自动构造同源 URL，默认不会跨域调用（`ui/src/index.tsx:20-26`）
 3. **WebSocket Header 限制**：浏览器标准 WebSocket API **不支持自定义请求头**，因此 X-Gotify-Key 仅适用于 HTTP API
-4. **Cookie 三重阻碍**：完全跨域场景下，`axios.withCredentials=false` + `cors.AllowCredentials=false` + `SameSite=Strict` 三重阻碍导致 Cookie 认证完全失效
-5. **WebSocket 认证依赖**：跨域场景下 WebSocket 必须依赖 Cookie 或 Query Token，Header 认证不可用
+4. **Token 来源闭环问题**：`/auth/local/login` 只通过 Cookie 返回 Token，响应体中**不包含 Token 字段**（`api/session.go:89-97`，`model/user.go:88-113`）
+5. **混合认证不可直接落地**：由于登录接口不返回 Token，「Header+Query 混合认证」在**当前代码下无法直接落地**，必须修改后端接口或使用 Basic Auth 迂回
+6. **Cookie 三重阻碍**：完全跨域场景下，`axios.withCredentials=false` + `cors.AllowCredentials=false` + `SameSite=Strict` 三重阻碍导致 Cookie 认证完全失效
 
 ### 最佳实践
 1. **同域部署优先**：利用前端自动构造同源 URL 的特性，避免跨域复杂性
 2. **反向代理其次**：通过 Nginx 反代实现浏览器认为的同域，无需修改代码
-3. **WebSocket 正则简化**：只写 hostname 匹配，如 `^my-app\.com$`
-4. **完全跨域场景推荐混合认证**：
-   - HTTP API 使用 X-Gotify-Key Header
-   - WebSocket 使用 ?token=xxx Query 参数
-   - 无需修改 Cookie 和 CORS AllowCredentials
+3. **完全跨域场景**：
+   - 如能修改后端：推荐方案 C（启用跨域 Cookie）改动量最小
+   - 如不能修改后端：使用「Basic Auth 创建客户端获取 Token + Header + Query Token」组合可勉强落地
+4. **WebSocket 正则简化**：只写 hostname 匹配，如 `^my-app\.com$`
 5. **明确配置 `trustedproxies`**：不使用 `0.0.0.0/0`，明确列出可信代理
-6. **生产环境启用 `securecookie`**：配合 HTTPS 使用，跨域场景必须
 
 ### 部署决策树
 ```
 开始
   ↓
 是否可以同域部署？
-  ├─ 是 → 场景 A：直接部署 ✅（零配置，零风险）
+  ├─ 是 → 场景 A：直接部署 ✅（零配置，零风险，推荐首选）
   └─ 否
       ↓
 是否可以通过反向代理实现浏览器认为的同域？
@@ -590,6 +527,9 @@ server:
       └─ 否 → 场景 C：完全跨域
           ↓
           选择方案：
-          ├─ 方案 1：Header+Query 混合认证 ✅（推荐，改动小，风险中）
-          └─ 方案 2：启用跨域 Cookie（改动大，风险高）
+          ├─ 能修改后端？
+          │   ├─ 是 → 方案 C：启用跨域 Cookie（3 处改动，体验好）
+          │   └─ 否 → 方案 B：Basic Auth 创建客户端（仅前端修改，体验差）
+          └─
+              └─ 追求最佳体验 → 修改登录接口返回 Token + Header+Query 混合
 ```
