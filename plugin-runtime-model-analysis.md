@@ -1,4 +1,7 @@
 # Gotify Server 插件系统运行模型分析
+## （复核更正版 - 2026-05-16）
+
+---
 
 ## 一、系统架构概述
 
@@ -6,7 +9,7 @@
 
 | 层级 | 主要职责 | 核心文件 |
 |------|----------|----------|
-| **插件API层** | 对外暴露插件管理接口、配置接口、Webhook路由 | `api/plugin.go` |
+| **插件API层** | 插件管理接口（需鉴权） | `api/plugin.go` |
 | **插件管理器层** | 插件生命周期管理、实例化、能力注入 | `plugin/manager.go` |
 | **兼容性适配层** | 多版本Plugin API兼容转换 | `plugin/compat/v1.go`, `plugin/compat/instance.go` |
 | **鉴权中间件层** | 请求认证、权限校验、会话管理 | `auth/authentication.go` |
@@ -35,7 +38,7 @@ const (
 
 ```
 1. Manager 初始化 (plugin/manager.go:56-101)
-   ├─ 启动消息处理goroutine (channel消费循环)
+   ├─ 启动消息处理goroutine (无缓冲channel消费循环)
    ├─ 从插件目录加载所有.so文件 (loadPlugins)
    │  └─ 通过 Go plugin 机制打开，调用 compat.Wrap()
    │     └─ 查找并调用 `GetGotifyPluginInfo()` 和 `NewGotifyPluginInstance()`
@@ -47,184 +50,244 @@ const (
    │  ├─ Messenger → 注入 redirectToChannel 消息处理器
    │  ├─ Storager → 注入 dbStorageHandler 存储处理器
    │  ├─ Configurer → 初始化配置，验证并设置
-   │  └─ Webhooker → 注册Gin路由组到 /plugin/:id/custom/
+   │  └─ Webhooker → 关键：注册到 /plugin/:id/custom/{token}/ 路径
+   │                  注意：此路由组**无用户身份验证**！
    └─ 如果插件已启用状态，调用 instance.Enable()
 ```
 
 ### 2.2 关键初始化代码分析
 
-**插件配置与应用令牌生成** (`plugin/manager.go:399-425`)：
+**插件配置与令牌生成** (`plugin/manager.go:399-425`):
 
 ```go
 func (m *Manager) createPluginConf(instance compat.PluginInstance, info compat.Info, userID uint) {
-    // 1. 生成唯一插件Token (auth.GeneratePluginToken)
+    // 1. 生成唯一 Plugin Token (P前缀，23字符)
+    //    作用：a) 数据库唯一标识 b) **Webhook URL的访问凭据**
     // 2. 对于 Messenger 能力插件：
     //    - 创建专属 Application 实体
-    //    - 生成独立的应用令牌
+    //    - 生成独立的 Application Token (A前缀)
     //    - 标记为 Internal 类型（UI隐藏）
     // 3. 持久化 PluginConf 到数据库
 }
 ```
 
-**跨模块副作用**：
-- 初始化时为每个Messenger插件创建独立的Application记录
-- 修改用户的Application列表状态（Internal字段）
-- 在Gin引擎中动态注册路由组
+**初始化时序的跨模块副作用**：
+| 操作 | 模块 | 是否事务 | 失败影响 |
+|------|------|---------|---------|
+| Plugin Token生成 | auth | 否 | 循环重试直到成功 |
+| Application创建 | database | 是 | 失败则整个插件初始化失败 |
+| PluginConf持久化 | database | 是 | 同上 |
+| 路由注册 | router | - | 内存操作，无失败 |
+| 插件Enable调用 | 插件代码 | - | 失败则标记为Disabled，更新DB |
 
 ---
 
-## 三、鉴权模块与插件交互机制
+## 三、鉴权机制与令牌设计（★ 重大更正）
 
-### 3.1 鉴权中间件工作原理
+### 3.1 鉴权中间件作用范围的关键事实
 
-**Token 读取优先级链** (`auth/authentication.go:205-247`)：
+**核心纠正**：插件管理API与自定义Webhook使用**完全不同的鉴权路径**
+
+| 路由路径 | 鉴权中间件 | 权限校验 |
+|---------|-----------|---------|
+| `GET /plugin` | `RequireClient` | 需登录客户端 |
+| `GET /plugin/:id/config` | `RequireClient` | 需登录 + `isPluginOwner` 校验 |
+| `POST /plugin/:id/config` | `RequireClient` | 需登录 + `isPluginOwner` 校验 |
+| `POST /plugin/:id/enable` | `RequireClient` | 需登录 + `isPluginOwner` 校验 |
+| **`/plugin/:id/custom/{token}/***`** | **无鉴权中间件** | **仅检查插件是否启用** |
+
+### 3.2 Webhook自定义入口的鉴权路径详解
+
+**完整URL结构与安全机制** (`router.go:93`, `plugin/manager.go:348-352`):
 
 ```
-1. Query 参数 (?token=xxx)
-2. X-Gotify-Key 请求头
-3. Authorization: Bearer 请求头
-4. Cookie (gotify-client-token)
+/plugin/{plugin_id}/custom/{plugin_token}/{plugin_defined_path}
+         │                │                      │
+         │                │                      └── 插件注册的子路径
+         │                │
+         │                └── Plugin Token (P前缀，23字符)
+         │                    ✓ 作为访问凭据，"秘密"在URL中
+         │                    ✓ 数据库唯一索引约束
+         │                    ✗ 不在Header中，不在Query中
+         │                    ✗ 不验证用户身份！
+         │
+         └── 插件数据库ID (uint)
+              ✓ 用于 requirePluginEnabled 中间件
+              ✗ 从闭包捕获，硬编码在中间件实例中
+              ✗ 不从URL动态解析！
 ```
 
-**鉴权状态机**：
-- `authStateSkip` → 跳过当前鉴权方式，尝试下一种
-- `authStateOk` → 认证成功，注入用户/客户端/应用上下文
-- `authStateForbidden` → 权限不足，返回403
-- `authStateNotElevated` → 需要提升权限，返回特殊403
-
-### 3.2 插件相关的权限校验点
-
-**插件API层权限校验** (`api/plugin.go:406-408`)：
-
-```go
-func isPluginOwner(ctx *gin.Context, conf *model.PluginConf) bool {
-    return conf.UserID == auth.GetUserID(ctx)
-}
-```
-
-**Webhook路由插件启用校验** (`plugin/pluginenabled.go:9-20`)：
+**requirePluginEnabled 实现细节** (`plugin/pluginenabled.go:9-20`):
 
 ```go
 func requirePluginEnabled(id uint, db Database) gin.HandlerFunc {
-    // 访问自定义webhook前验证插件是否处于启用状态
+    return func(c *gin.Context) {
+        // 重要：id 是闭包捕获的编译时常量！
+        // 不从URL的 :id 参数动态读取
+        conf, err := db.GetPluginConfByID(id)
+        if err != nil { c.AbortWithError(500, err); return }
+        if conf == nil || !conf.Enabled {
+            c.AbortWithError(400, errors.New("plugin is disabled"))
+        }
+        // 不进行任何用户身份验证！
+    }
 }
 ```
 
-### 3.3 插件令牌的双重机制
+### 3.3 双令牌机制的真实作用
 
-插件系统存在两类独立令牌：
+**令牌属性对比表** (`auth/token.go:37-55`):
 
-| 令牌类型 | 用途 | 生成位置 |
-|---------|------|---------|
-| **Plugin Token** | 标识插件实例，构成webhook路径 | `auth.GeneratePluginToken()` |
-| **Application Token** | 插件发送消息时的身份标识 | `auth.GenerateApplicationToken()` |
+| 属性 | Plugin Token | Application Token |
+|------|-------------|------------------|
+| 前缀 | `P` | `A` |
+| 长度 | 23字符 | 23字符 |
+| 生成函数 | `GeneratePluginToken()` | `GenerateApplicationToken()` |
+| 唯一性保证 | `GenerateNotExistingToken()` 循环重试 | 同左 |
+| 数据库索引 | `uniqueIndex:uix_plugin_confs_token` | `uniqueIndex:uix_applications_token` |
+| **暴露方式** | **URL路径明文** | 仅内部使用，不暴露 |
+| **访问控制粒度** | **插件实例级别** | 应用级别 |
+| **用户身份关联** | **无 - 知道URL即访问** | 通过Application关联用户 |
+| 用途1 | Webhook路径凭据 | 消息发送身份标识 |
+| 用途2 | 插件实例唯一标识 | REST API `/message` 认证 |
 
-**关键安全设计**：两类令牌均通过"检查-生成"原子操作确保唯一性。
-
----
-
-## 四、消息推送流程
-
-### 4.1 插件消息发送链路
-
-```
-1. 插件调用 msgHandler.SendMessage() (echo.go:85-92)
-   ↓ (PluginV1MessageHandler 适配器)
-2. compat.Message 结构转换
-   ↓ (redirectToChannel.SendMessage, messagehandler.go:22-36)
-3. 封装为 MessageWithUserID 写入channel
-   ↓ (manager.go:67-84 goroutine 消费)
-4. 转换为 model.Message 写入数据库
-5. 调用 notifier.Notify() 推送到WebSocket流
-6. 实时广播给该用户的所有在线客户端
-```
-
-### 4.2 消息传递关键数据结构
-
-**消息Context传递链**：
-```
-plugin.Message → compat.Message → model.MessageExternal → model.Message
-```
-
-**重要字段注入** (`plugin/messagehandler.go:24-34`)：
-- `ApplicationID`: 绑定到插件专属应用
-- `UserID`: 隔离用户消息空间
-- `Date`: 服务器时间戳注入
-- `Extras`: 附加元数据（可包含插件标识）
-
-### 4.3 异步消息处理的副作用
-
-- 通过无缓冲channel实现异步解耦
-- 数据库写入与WebSocket推送在同一goroutine串行执行
-- 消息发送成功后无回执机制（Fire-and-Forget）
-- 失败场景下仅记录日志，无重试机制
+**关键安全结论**：
+1. Plugin Token是**安全性与可用性的权衡** - URL即凭证
+2. 知道Plugin Token的任何人都可调用该插件的所有自定义Webhook
+3. 插件作者必须自行在handler内实现额外的访问控制（如签名校验）
 
 ---
 
-## 五、跨模块交互与副作用分析
+## 四、消息推送流程与边界条件（★ 补充精确分析）
 
-### 5.1 插件能力注入矩阵
+### 4.1 消息推送完整调用链与对账清单
 
-| 能力接口 | 注入Handler | 副作用范围 |
-|---------|------------|-----------|
-| `Messenger` | `redirectToChannel` | 写入消息channel、触发DB写入、WebSocket广播 |
-| `Storager` | `dbStorageHandler` | 读写PluginConf.Storage字段 |
-| `Configurer` | 直接调用实例方法 | YAML序列化/反序列化、DB更新 |
-| `Webhooker` | Gin RouterGroup | 动态注册HTTP路由 |
-| `Displayer` | 无Handler注入 | 仅API层调用GetDisplay |
+**步骤级调用顺序** (`plugin/manager.go:67-84`, `plugin/messagehandler.go:22-36`):
 
-### 5.2 关键跨模块边界
+| 步骤 | 位置 | 操作 | 同步/异步 | 阻塞点 | 失败处理 |
+|------|------|------|----------|--------|---------|
+| 1 | echo.go:85 | 插件调用 `msgHandler.SendMessage()` | 同步 | 否 | 插件自行处理 |
+| 2 | v1.go:151 | `PluginV1MessageHandler` 适配器转换 | 同步 | 否 | 返回error |
+| 3 | messagehandler.go:23 | 封装 `MessageWithUserID` | 同步 | 否 | 无 |
+| 4 | messagehandler.go:24 | **写入无缓冲channel** | **同步阻塞** | ✅ **有** | 永久阻塞直到消费 |
+| 5 | manager.go:69 | 消费goroutine读取channel | 异步 | 否 | 永久阻塞直到有消息 |
+| 6 | manager.go:70-79 | 转换为 `model.Message` | 异步 | 否 | `json.Marshal` 静默失败 |
+| 7 | manager.go:80 | `db.CreateMessage()` 持久化 | 异步 | ✅ 有 | 无重试，消息丢失 |
+| 8 | manager.go:81 | 回填 `Message.ID` | 异步 | 否 | 无 |
+| 9 | manager.go:82 | `notifier.Notify()` WebSocket推送 | 异步 | ✅ 有 | 无重试，在线客户端丢失 |
 
-**Plugin Manager ↔ Auth 模块**
-- 调用Token生成函数创建唯一标识
-- 不直接使用鉴权中间件，令牌生成逻辑复用
+### 4.2 阻塞边界的精确刻画
 
-**Plugin Manager ↔ Database 模块**
-- 通过Database接口进行依赖倒置
-- 事务边界外操作，多个DB调用非原子
+**Channel类型确认** (`plugin/manager.go:62`):
+```go
+messages: make(chan MessageWithUserID)  // 无缓冲！容量=0
+```
 
-**Plugin Manager ↔ Stream API 模块**
-- 通过Notifier接口解耦
-- 消息写入DB后才进行WebSocket推送
+**阻塞场景矩阵**：
+
+| 阻塞位置 | 触发条件 | 影响范围 | 恢复条件 |
+|---------|---------|---------|---------|
+| 插件侧 SendMessage | 消费goroutine阻塞时 | 调用该方法的插件goroutine阻塞 | 消费goroutine恢复处理 |
+| 消费侧 DB写入 | 数据库慢查询、连接耗尽 | 所有插件的消息推送全部阻塞 | DB恢复响应 |
+| 消费侧 WebSocket推送 | 大量在线客户端，stream.Notify 阻塞 | 所有插件的消息推送全部阻塞 | 推送完成或超时 |
+
+**关键风险**：单个插件的消息处理阻塞会**全局影响所有插件的消息推送能力**。
+
+### 4.3 失败边界的精确刻画
+
+**失败场景与数据丢失情况**：
+
+| 失败点 | 是否持久化 | 消息状态 | 可恢复性 | 日志记录 |
+|-------|-----------|---------|---------|---------|
+| channel写入前 | 否 | 完全丢失 | 不可恢复 | 无 |
+| DB写入失败 | 否 | 完全丢失 | 不可恢复 | 仅Gorm内部日志 |
+| WebSocket推送失败 | ✅ 已持久化 | 离线客户端可拉取 | 离线可恢复 | 仅stream内部日志 |
+| 服务重启 channel中消息 | 否 | 完全丢失 | 不可恢复 | 无 |
+
+**静默失败点** (`plugin/manager.go:78`):
+```go
+if message.Message.Extras != nil {
+    internalMsg.Extras, _ = json.Marshal(message.Message.Extras)
+    // 注意：_ 忽略错误，Extras序列化失败静默继续
+}
+```
 
 ---
 
-## 六、示例插件（Echo Plugin）完整生命周期
+## 五、跨模块交互与副作用的精确对账
 
-### 6.1 插件实现分析
+### 5.1 插件能力注入的副作用矩阵
 
-以 `plugin/example/echo/echo.go` 为例，该插件实现了所有5种能力接口。
+| 能力接口 | 注入的Handler | 同步/异步 | 模块边界跨越 | 副作用 |
+|---------|--------------|----------|------------|-------|
+| `Messenger` | `redirectToChannel` | 混合 | plugin → database → stream | 1. 阻塞写入无缓冲channel<br>2. 触发异步DB写入<br>3. 触发异步WebSocket广播 |
+| `Storager` | `dbStorageHandler` | 同步 | plugin → database | 1. 同步读写PluginConf.Storage字段<br>2. 无事务保护 |
+| `Configurer` | 直接调用实例方法 | 同步 | plugin → database | 1. YAML序列化/反序列化<br>2. 同步UpdatePluginConf |
+| `Webhooker` | Gin RouterGroup | - | plugin → router | 1. 无鉴权动态注册路由<br>2. 每个插件实例独立路径 |
+| `Displayer` | 无Handler注入 | 同步 | api → plugin | 1. 仅API层GetDisplay时调用<br>2. 无副作用 |
 
-### 6.2 Webhook 执行流程
+### 5.2 Webhook请求的完整调用栈
+
+**以Echo Plugin的/echo端点为例**：
 
 ```
-1. HTTP GET /plugin/{id}/custom/echo
-   ↓ (requirePluginEnabled 中间件)
-2. 验证插件启用状态
-   ↓ (EchoPlugin.RegisterWebhook handler)
-3. 通过 dbStorageHandler 加载存储数据 (CalledTimes)
-4. CalledTimes++
-5. 存储写回数据库
-6. 通过 msgHandler.SendMessage() 发送通知
-   ├─ 进入消息channel
-   └─ 异步完成DB写入和WebSocket推送
-7. 返回响应：Magic String + Webhook URL
+HTTP GET /plugin/5/custom/Pabc123xyz/echo
+        │
+        ├─ [Gin路由匹配] 无鉴权中间件
+        │
+        ├─ requirePluginEnabled(5) 中间件
+        │   └─ db.GetPluginConfByID(5) 检查Enabled字段
+        │
+        └─ EchoPlugin handler
+             ├─ dbStorageHandler.Load() → db.GetPluginConfByID().Storage
+             ├─ CalledTimes++
+             ├─ dbStorageHandler.Save() → db.UpdatePluginConf()
+             ├─ msgHandler.SendMessage() → 写入无缓冲channel (可能阻塞)
+             └─ 返回响应
 ```
 
-### 6.3 单请求内的跨模块操作
-
-| 操作 | 涉及模块 |
-|------|---------|
-| 插件状态校验 | plugin, database |
-| 存储读取 | plugin, database |
-| 存储写入 | plugin, database |
-| 消息入队 | plugin (channel) |
-| 消息持久化 | database (异步) |
-| WebSocket推送 | api/stream (异步) |
+**单请求内的数据库操作次数对账**：
+1. `GetPluginConfByID` - 插件启用检查
+2. `GetPluginConfByID` - Storage读取
+3. `UpdatePluginConf` - Storage保存
+4. `CreateMessage` - 异步消息持久化（可能在响应返回后）
 
 ---
 
-## 七、架构设计要点总结
+## 六、示例插件（Echo Plugin）生命周期对账
+
+### 6.1 插件初始化时的数据库写入对账
+
+初始化用户ID=1的Echo Plugin时：
+
+| 操作 | 表 | 字段 | 值 |
+|------|----|------|----|
+| 1. 创建PluginConf | plugin_confs | id | 自增 (例: 5) |
+| | | user_id | 1 |
+| | | module_path | github.com/gotify/server/v2/plugin/example/echo |
+| | | token | P + 22随机字符 |
+| | | config | YAML序列化默认配置 |
+| | | enabled | false (待Enable) |
+| 2. 创建Application (Messenger能力) | applications | id | 自增 (例: 42) |
+| | | user_id | 1 |
+| | | token | A + 22随机字符 |
+| | | name | "test plugin" |
+| | | description | auto generated description |
+| | | internal | true |
+
+### 6.2 单次Webhook调用的资源对账
+
+调用 `/plugin/5/custom/Pxxx/echo` 一次：
+
+| 资源变更 | 原值 | 新值 |
+|---------|------|------|
+| PluginConf.Storage CalledTimes | N | N+1 |
+| messages 表记录数 | M | M+1 |
+| 在线客户端WebSocket消息计数 | K | K+在线人数 |
+
+---
+
+## 七、架构设计要点总结（修正版）
 
 ### 7.1 优秀设计实践
 
@@ -238,22 +301,26 @@ plugin.Message → compat.Message → model.MessageExternal → model.Message
    - 具体实现通过构造函数注入
    - 便于单元测试Mock
 
-3. **适配器模式**
-   - PluginV1Instance封装API版本差异
-   - 消息Handler、存储Handler多层适配
-   - 对外接口稳定
-
-4. **用户隔离机制**
+3. **用户隔离机制**
    - 每个用户拥有独立的插件实例
    - 消息流、存储、配置完全隔离
    - 插件间无共享状态
 
-### 7.2 潜在改进点
+### 7.2 已确认的设计权衡与潜在风险
 
-1. **消息可靠性**：当前异步消息发送缺乏失败重试与持久化保证
-2. **初始化原子性**：多用户插件初始化非事务，部分失败可能导致不一致状态
-3. **Webhook安全**：自定义路由无额外鉴权，仅依赖插件启用状态检查
-4. **并发安全**：实例map使用RWMutex，但Enable/Disable期间的并发访问需注意
+1. **Webhook安全模型**：以Token-in-URL替代用户鉴权，便于第三方集成但增大了泄露风险
+2. **消息可靠性**：无缓冲channel + 无重试机制，阻塞即全局影响，丢失即永久丢失
+3. **初始化原子性**：多用户插件初始化非事务，部分失败可能导致不一致状态
+4. **全局单channel设计**：所有插件共享一个消息channel，单慢消费者拖慢全局
+
+### 7.3 代码级改进建议
+
+| 改进点 | 位置 | 建议方案 |
+|-------|------|---------|
+| Webhook鉴权 | router.go:93 | 增加可选的鉴权中间件，或允许插件注册自定义auth handler |
+| Channel缓冲 | manager.go:62 | 改为有缓冲channel，配置容量 |
+| 消息重试机制 | manager.go:67-84 | 增加死信队列或重试逻辑 |
+| 插件隔离 | manager.go | 每个插件实例独立channel，避免全局阻塞 |
 
 ---
 
@@ -261,8 +328,8 @@ plugin.Message → compat.Message → model.MessageExternal → model.Message
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  Plugin API     │────▶│  Auth Module    │────▶│  Perm Check     │
-│  (api/plugin.go)│     │  (middleware)   │     │  (isPluginOwner)│
+│  Plugin API     │────▶│  Auth Module    │────▶│ isPluginOwner   │
+│  (api/plugin.go)│     │ RequireClient   │     │  ownership check│
 └────────┬────────┘     └─────────────────┘     └─────────────────┘
          │
          ▼
@@ -272,21 +339,23 @@ plugin.Message → compat.Message → model.MessageExternal → model.Message
 └────────┬────────┘     └─────────────────┘     └────────┬────────┘
          │                                                │
          │    ┌──────────────┐    ┌────────────────┐     │
-         ├───▶│ Msg Handler  │───▶│ Message Chan   │────▶│
+         ├───▶│ Msg Handler  │───▶│ 无缓冲 Channel  │────▶│ 同步阻塞！
          │    └──────────────┘    └────────┬───────┘     │
          │                                  │             │
          │    ┌──────────────┐    ┌────────▼───────┐     │
          └───▶│ Stor Handler │───▶│ Database       │◀────┘
-              └──────────────┘    └────────┬───────┘
-                                           │
-                                  ┌────────▼───────┐
-                                  │ Stream Notify  │
-                                  │ (WebSocket)    │
-                                  └────────────────┘
+         │    └──────────────┘    └────────┬───────┘
+         │                                  │
+         ▼                                  ▼
+┌───────────────────────────┐    ┌─────────────────┐
+│ /plugin/:id/custom/{token}/│    │ Stream Notify   │
+│    无鉴权！仅检查启用       │    │ (WebSocket)     │
+└───────────────────────────┘    └─────────────────┘
 ```
 
 ---
 
-**分析完成时间**：2026-05-16  
-**代码基线**：gotify/server v2 插件系统  
-**覆盖模块**：plugin/, api/plugin.go, auth/, database/plugin.go
+**复核完成时间**：2026-05-16  
+**代码基线**：gotify/server v2 插件系统 git HEAD
+**复核覆盖**：router.go, manager.go, auth/token.go, pluginenabled.go, messagehandler.go  
+**关键更正数**：4项（鉴权路径、令牌作用、阻塞边界、失败边界）
