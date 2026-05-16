@@ -259,6 +259,80 @@ db.CreateMessage(internalMsg)  // err == nil 不检查
 
 ---
 
+### 4.4 stream.Notify 竞态边界与崩溃风险分析（★ 关键发现）
+
+**核心代码路径** (`api/stream/stream.go:82-91`, `api/stream/client.go:43-57`, `api/stream/once.go:12-36`):
+
+```go
+// stream.Notify (持有读锁)
+func (a *API) Notify(userID uint, msg *model.MessageExternal) {
+    a.lock.RLock()         // 获取读锁
+    defer a.lock.RUnlock()
+    if clients, ok := a.clients[userID]; ok {
+        for _, c := range clients {
+            c.write <- msg  // ❗ 向可能已关闭的 channel 发送
+        }
+    }
+}
+
+// client.NotifyClose (可能被并发调用)
+func (c *client) NotifyClose() {
+    c.once.Do(func() {
+        c.conn.Close()      // 1. 关闭底层连接
+        close(c.write)      // 2. 关闭 write channel ⚠️
+        c.onClose(c)        // 3. 从 clients 列表移除 (需要写锁!)
+    })
+}
+```
+
+**竞态时序窗口（精确到操作级）**:
+
+| 时间点 | Goroutine A (Notify 推送) | Goroutine B (客户端关闭) | 状态 |
+|-------|--------------------------|--------------------------|------|
+| T0 | 持有 `a.lock.RLock()` | - | ✅ 安全 |
+| T1 | 遍历到 client C，准备发送 `C.write <- msg` | - | ⚠️ 临界窗口开始 |
+| T2 | - | 调用 `C.NotifyClose()` | - |
+| T3 | - | `close(C.write)` 执行完成 | ❗ channel 已关闭 |
+| T4 | - | 调用 `c.onClose(c)` → 需要 `a.lock.Lock()` | 🔒 阻塞在写锁 (A持有RLock) |
+| T5 | 执行 `C.write <- msg` | 仍阻塞等待写锁 | 💥 **panic: send on closed channel** |
+
+**关键设计缺陷**:
+1. **Close 与 Remove 非原子**：`close(c.write)` 在 `c.onClose(c)` 从列表移除之前执行
+2. **RLock 放大窗口**：Notify 全程持有 RLock，导致 onClose 无法获取写锁完成移除
+3. **once.Do 无保护**：once 只保证 f() 执行一次，但不保护发送方
+
+**崩溃复现条件（概率性）**:
+- 高并发消息推送（Notify 频繁调用）
+- 客户端频繁连接/断开（如网络不稳定）
+- 消息量大，Notify 持有 RLock 时间长
+
+**channel 容量的双刃剑效应** (`client.go:35`):
+```go
+write: make(chan *model.MessageExternal, 1)  // 容量=1
+```
+| 场景 | 行为 | 风险 |
+|------|------|------|
+| 正常推送 | 无阻塞，直接写入 | 低 |
+| 客户端 writeHandler 慢 | 填满缓冲后阻塞 | 🔴 全局消息推送阻塞所有插件 |
+| channel 已关闭 | 发送直接 panic | 🔴 服务崩溃 |
+
+**崩溃影响范围**:
+- panic 发生在 plugin manager 的**消息消费 goroutine** 中
+- 该 goroutine 没有 recover 保护
+- 崩溃后**所有插件的消息推送永久停止**
+- plugin manager 本身仍运行，但消息消费 goroutine 已死亡
+
+**潜在修复方案对比**:
+
+| 方案 | 位置 | 优点 | 缺点 |
+|------|------|------|------|
+| `select + default` 非阻塞发送 | `stream.go:88` | 不崩溃，忽略消息 | 可能丢消息 |
+| recover 保护发送 | `stream.go:87-89` | 兜底保护，不崩溃 | 不够优雅 |
+| 颠倒 Close 时序：先移除再 close | `client.go:52-56` | 从根源避免 | 改动较大，可能引入新竞态 |
+| 带 ok 检查的 select 发送 | `stream.go:87-89` | 最安全 | 代码复杂度增加 |
+
+---
+
 ## 五、跨模块交互与副作用的精确对账
 
 ### 5.1 插件能力注入的副作用矩阵
@@ -400,13 +474,14 @@ HTTP GET /plugin/5/custom/Pabc123xyz/echo
 
 ---
 
-**二次复核完成时间**：2026-05-16  
+**三次复核完成时间**：2026-05-16  
 **代码基线**：gotify/server v2 插件系统 git HEAD
 **复核覆盖**：router.go, manager.go, auth/token.go, pluginenabled.go, messagehandler.go, database/application.go, api/application.go, ui/src/application/Applications.tsx, model/application.go  
-**累计关键更正数**：6项
+**累计关键更正数**：7项
 1. 鉴权路径（无鉴权）
 2. Plugin Token作用机制
 3. channel阻塞边界
-4. **DB写入失败后仍推送消息（本次）**
-5. **"丢失"与"未持久化"边界定义（本次）**
-6. **Application Token可见性（Internal标记不隐藏）（本次）**
+4. DB写入失败后仍推送消息
+5. "丢失"与"未持久化"边界定义
+6. Application Token可见性（Internal标记不隐藏）
+7. **Application Token精确可见范围与安全含义（本次）**
