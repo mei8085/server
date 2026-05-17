@@ -1,7 +1,7 @@
 # 分页模型与列表查询复用方式分析报告
 
-> 版本: v2.0 (补充API层细节与鉴权约束)
-> 核对状态: ✅ 所有结论已与代码核对
+> 版本: v3.0 (事实校准版)
+> 核对状态: ✅ 所有结论已逐段与代码核对
 
 ---
 
@@ -28,6 +28,8 @@ type PagedMessages struct {
     Messages []*MessageExternal `json:"messages"`
 }
 ```
+
+✅ **核对结论**: 与代码一致
 
 ---
 
@@ -112,6 +114,9 @@ func (a *MessageAPI) GetMessages(ctx *gin.Context) {
 **GetMessagesWithApplication 额外步骤**:
 - ✅ 应用存在性校验 (`GetApplicationByID`)
 - ✅ 应用归属权校验 (`app.UserID == auth.GetUserID(ctx)`)
+- ❌ 归属权校验失败返回 404 (非 403)
+
+✅ **核对结论**: 与代码一致
 
 ---
 
@@ -189,14 +194,16 @@ RequireClient
 
 ### 5.2 Handler 内部二次鉴权
 
-| 接口 | 内部鉴权逻辑 | 位置 |
-|-----|-------------|------|
-| `GET /message` | ❌ 无 (路由鉴权已保证 user_id 正确) | - |
-| `GET /application/{id}/message` | ✅ 检查应用归属: `app.UserID == auth.GetUserID(ctx)` | `api/message.go:186` |
-| `GET /application` | ❌ 无 (数据库查询已按 user_id 过滤) | - |
-| `GET /client` | ❌ 无 (数据库查询已按 user_id 过滤) | - |
+| 接口 | 内部鉴权逻辑 | 位置 | 失败返回 |
+|-----|-------------|------|---------|
+| `GET /message` | ❌ 无 (路由鉴权已保证 user_id 正确) | - | - |
+| `GET /application/{id}/message` | ✅ 检查应用归属: `app.UserID == auth.GetUserID(ctx)` | `api/message.go:186` | 404 |
+| `GET /application` | ❌ 无 (数据库查询已按 user_id 过滤) | - | - |
+| `GET /client` | ❌ 无 (数据库查询已按 user_id 过滤) | - | - |
 
-> **注意**: `GET /application/{id}/message` 是唯一需要二次鉴权的列表接口，因为路径参数 `id` 可能被篡改。
+> **重要修正**: `GET /application/{id}/message` 鉴权失败返回 **404** (不是 403)，目的是隐藏应用存在性信息。
+
+✅ **核对结论**: 与代码一致，`api/message.go:194` 明确返回 404
 
 ---
 
@@ -332,21 +339,158 @@ func (d *GormDatabase) GetClientsByUser(userID uint) ([]*model.Client, error) {
 
 ---
 
-## 8. 对前端 Store 状态的影响
+## 8. 前端 Axios 拦截器与错误处理
 
-### 8.1 鉴权约束传导到前端
+### 8.1 响应拦截器配置 (`apiAuth.ts:5-23`)
 
-**路由鉴权 → 前端 axios 配置**:
-- 所有列表请求通过 `apiAuth.ts` 注入 `X-Gotify-Key` header
-- 401/403 响应触发登出流程 (`CurrentUser` store)
+```typescript
+export const initAxios = (currentUser: CurrentUser, snack: SnackReporter) => {
+    axios.interceptors.response.use(undefined, (error) => {
+        if (!error.response) {
+            snack('Gotify server is not reachable, try refreshing the page.');
+            return Promise.reject(error);
+        }
 
-**二次鉴权 → 前端错误处理**:
-- `GET /application/{id}/message` 的 404 错误由前端 `MessagesStore` 静默处理
-- 无效应用ID不会导致全局错误，仅显示空消息列表
+        const status = error.response.status;
+
+        if (status === 401) {
+            currentUser.tryAuthenticate().then(() => snack('Could not complete request.'));
+        }
+
+        if (status === 400 || status === 403 || status === 500) {
+            snack(error.response.data.error + ': ' + error.response.data.errorDescription);
+        }
+
+        return Promise.reject(error);
+    });
+};
+```
+
+**拦截器处理逻辑**:
+| 状态码 | 处理方式 |
+|-------|---------|
+| 无响应 (网络错误) | 显示 "服务器不可达" 消息，reject |
+| 401 | 调用 `tryAuthenticate()` 重新认证，显示 "请求失败"，reject |
+| 400, 403, 500 | 显示具体错误消息，reject |
+| 404 | ❌ 无特殊处理，直接 reject |
+| 其他 | ❌ 无特殊处理，直接 reject |
+
+> **重要修正**: 拦截器 **不处理 404 错误**，404 会直接 reject 到调用方。
+
+✅ **核对结论**: 与代码完全一致
 
 ---
 
-### 8.2 后处理逻辑传导到前端
+### 8.2 认证机制说明
+
+**❌ 错误描述修正**: 之前版本提到"所有列表请求通过 `apiAuth.ts` 注入 `X-Gotify-Key` header" —— 这是错误的。
+
+**✅ 实际认证机制**:
+- 前端不通过 header 注入 token
+- 认证通过 **Cookie** 实现：登录时服务器设置 `gotify-client-token` cookie
+- 浏览器自动在后续请求中携带 cookie
+- `apiAuth.ts` 只配置了响应拦截器，**没有配置请求拦截器**
+
+✅ **核对结论**: `apiAuth.ts` 中确实没有请求拦截器，只有响应拦截器
+
+---
+
+## 9. 404 / 鉴权失败场景的前端响应路径
+
+### 9.1 应用消息列表 404 场景
+
+**触发条件**:
+1. 用户手动输入无效应用ID URL: `/messages/9999`
+2. 应用被删除但用户仍访问旧URL
+3. 尝试访问其他用户的应用消息
+
+**后端响应**:
+- `GET /application/9999/message` → 404 Not Found
+
+**前端响应链**:
+```
+1. Messages.tsx: useEffect 调用 messagesStore.loadMore(9999)
+2. MessagesStore.loadMore(): 调用 fetchMessages(9999, 0)
+3. axios.get() → 收到 404 响应
+4. apiAuth.ts 拦截器: 404 不在处理范围内，直接 Promise.reject(error)
+5. MessagesStore.loadMore(): 
+   - try 块被跳过 (没有 catch)
+   - finally 块执行: this.loading = false
+   - ❗ state.loaded 永远不会被设置为 true
+6. Messages.tsx: 
+   - !messagesStore.loaded(appId) → true
+   - 一直显示 <LoadingSpinner />
+```
+
+**实际表现**: 页面一直显示加载中，没有错误提示，也不会显示空消息列表。
+
+⚠️ **边界情况 Bug**: 404 场景下 UI 会无限显示加载状态。
+
+✅ **核对结论**: 与代码完全一致:
+- `loadMore` 只有 try/finally，没有 catch (`ui/src/message/MessagesStore.ts:49-71`)
+- `loaded = true` 只在 try 块成功时设置 (`ui/src/message/MessagesStore.ts:64`)
+- `Messages.tsx` 根据 `loaded` 显示 LoadingSpinner (`ui/src/message/Messages.tsx:150`)
+
+---
+
+### 9.2 401 未授权场景
+
+**触发条件**: Token 过期或被注销
+
+**前端响应链**:
+```
+1. axios 请求收到 401
+2. apiAuth.ts 拦截器: 调用 currentUser.tryAuthenticate()
+3. CurrentUser.tryAuthenticate():
+   - 再次请求 /current/user
+   - 如果失败且状态码 4xx → 调用 logout()
+4. logout() 设置 loggedIn = false
+5. Layout.tsx 中 RequireAuth 组件重定向到 /login
+6. reactions.ts 中 reaction 清空所有 store 状态
+```
+
+✅ **核对结论**: 与代码一致:
+- 401 处理: `apiAuth.ts:14-16`
+- tryAuthenticate 登出逻辑: `CurrentUser.ts:109-111`
+- 状态联动: `reactions.ts:37-46`
+
+---
+
+### 9.3 403 禁止访问场景
+
+**触发条件**: 无 Elevation 权限时执行敏感操作
+
+**前端响应链**:
+```
+1. axios 请求收到 403
+2. apiAuth.ts 拦截器: 显示错误消息 snack
+3. Promise.reject(error) 到调用方
+4. 调用方通常没有 catch，操作静默失败
+```
+
+> 注意: 列表查询接口 (`GET /message`, `GET /application`, `GET /client`) 不会返回 403，因为它们只需要 `RequireClient` 权限。403 主要出现在删除/修改等敏感操作。
+
+✅ **核对结论**: 与代码一致，列表接口路由组都使用 `RequireClient` 中间件
+
+---
+
+## 10. 对前端 Store 状态的影响
+
+### 10.1 鉴权约束传导到前端
+
+**路由鉴权 → 前端状态**:
+- 通过 Cookie 自动携带认证信息
+- 401 触发重新认证流程，最终可能登出
+- 登出触发所有 store 清空 (`reactions.ts:42-44`)
+
+**二次鉴权 → 前端状态**:
+- `GET /application/{id}/message` 的 404 **不会**触发任何状态更新
+- `loaded` 保持 false，UI 无限加载
+- **不会**显示空消息列表（之前版本描述错误）
+
+---
+
+### 10.2 后处理逻辑传导到前端
 
 | 后处理逻辑 | 前端响应方式 |
 |-----------|-------------|
@@ -356,7 +500,7 @@ func (d *GormDatabase) GetClientsByUser(userID uint) ([]*model.Client, error) {
 
 ---
 
-### 8.3 MessagesStore (分页状态管理)
+### 10.3 MessagesStore (分页状态管理)
 **位置**: `ui/src/message/MessagesStore.ts`
 
 **状态结构**:
@@ -369,7 +513,7 @@ interface MessagesState {
 }
 ```
 
-**状态流转**:
+**状态流转 (成功路径)**:
 1. **初始状态**: `hasMore = true`, `nextSince = 0`, `loaded = false`
 2. **加载更多**: 调用 `loadMore(appId)`，使用 `nextSince` 作为 `since` 参数
 3. **结果处理**:
@@ -377,6 +521,13 @@ interface MessagesState {
    - 更新 `nextSince = paging.since`
    - 更新 `hasMore = 'next' in paging`
    - 标记 `loaded = true`
+
+**状态流转 (失败路径)**:
+1. 请求失败 (404, 网络错误等)
+2. `try` 块跳过
+3. `finally` 块: `this.loading = false`
+4. `loaded` 保持 `false`
+5. `hasMore` 保持 `true` (可能导致重复请求)
 
 **状态隔离**: 按 `appId` 隔离状态，`AllMessages (-1)` 为特殊的全局视图。
 
@@ -386,7 +537,7 @@ interface MessagesState {
 
 ---
 
-### 8.4 AppStore (全量加载 + 排序状态)
+### 10.4 AppStore (全量加载 + 排序状态)
 **位置**: `ui/src/application/AppStore.ts`
 
 **状态结构**:
@@ -409,7 +560,7 @@ class AppStore extends BaseStore<IApplication> {
 
 ---
 
-### 8.5 ClientStore (全量加载 + Elevation 状态)
+### 10.5 ClientStore (全量加载 + Elevation 状态)
 **位置**: `ui/src/client/ClientStore.ts`
 
 **状态结构**:
@@ -432,7 +583,7 @@ class ClientStore extends BaseStore<IClient> {
 
 ---
 
-### 8.6 状态联动 (reactions.ts)
+### 10.6 状态联动 (reactions.ts)
 **位置**: `ui/src/reactions.ts:7-74`
 
 ```typescript
@@ -462,9 +613,9 @@ reaction(
 
 ---
 
-## 9. 大数据量场景下的性能边界
+## 11. 大数据量场景下的性能边界
 
-### 9.1 消息资源 (已优化)
+### 11.1 消息资源 (已优化)
 **优势**:
 - ✅ 游标分页性能稳定，避免 OFFSET 带来的性能问题
 - ✅ 限制单页最大 200 条，控制单次响应大小
@@ -475,10 +626,11 @@ reaction(
 - ⚠️ 单用户消息量过大时，全量删除 (`DELETE /message`) 可能耗时较长
 - ⚠️ 前端无限滚动加载过多消息时，内存占用会线性增长
 - ⚠️ 没有提供时间范围过滤，只能按 ID 游标回溯
+- ⚠️ 404 错误时 `hasMore` 保持 true，可能导致重复请求
 
 ✅ **核对结论**: 与代码一致
 
-### 9.2 应用资源 (假设小数据量)
+### 11.2 应用资源 (假设小数据量)
 **性能边界**:
 - ❌ 无分页，当用户应用数量超过数百时，单次响应会变大
 - ⚠️ 前端一次性渲染所有应用卡片，DOM 节点数随应用数增长
@@ -486,7 +638,7 @@ reaction(
 
 ✅ **核对结论**: 与代码一致
 
-### 9.3 客户端资源 (假设小数据量)
+### 11.3 客户端资源 (假设小数据量)
 **性能边界**:
 - ❌ 无分页，当用户客户端数量超过数百时，单次响应会变大
 - ✅ 客户端数据量通常更小 (单个用户几个到几十个设备)，实际影响有限
@@ -495,9 +647,9 @@ reaction(
 
 ---
 
-## 10. 复用方式总结与改进建议
+## 12. 复用方式总结与改进建议
 
-### 10.1 当前复用情况
+### 12.1 当前复用情况
 - **分页模型 (`Paging` 结构体)**: 仅被 `PagedMessages` 使用，未在应用/客户端中复用
 - **分页参数 (`pagingParams`)**: 定义在 `api/message.go` 中，属于消息API私有
 - **分页处理函数 (`withPaging`, `buildWithPaging`)**: 仅用于消息API
@@ -506,7 +658,7 @@ reaction(
 
 ✅ **核对结论**: 与代码一致
 
-### 10.2 统一抽象的可能性
+### 12.2 统一抽象的可能性
 
 **当前状态**: 三类资源采用不同策略是合理的，因为:
 1. 消息: 时间序列数据，可能大量积累，必须分页
@@ -523,23 +675,28 @@ reaction(
    }
    ```
 
-2. **增加消息的时间范围过滤**:
+2. **修复 MessagesStore 404 处理**:
+   - 在 `loadMore()` 中增加 catch 块
+   - 404 时设置 `loaded = true` 并显示空状态或错误提示
+   - 404 时设置 `hasMore = false` 避免重复请求
+
+3. **增加消息的时间范围过滤**:
    - 支持 `before` / `after` 时间参数，补充 ID 游标过滤的不足
 
-3. **前端 MessagesStore 内存优化**:
+4. **前端 MessagesStore 内存优化**:
    - 考虑实现消息列表的"虚拟分页"，只保留最近N页数据
    - 增加按日期分组的懒加载机制
 
-4. **应用/客户端的排序一致性**:
+5. **应用/客户端的排序一致性**:
    - 客户端列表也应增加明确的排序规则 (如 `last_used DESC` 或 `name ASC`)
 
-5. **权限过滤统一**:
+6. **权限过滤统一**:
    - 消息查询的 JOIN 方式可优化为子查询，提升性能
    - 考虑统一使用 `user_id` 直接过滤 (需要数据模型调整)
 
 ---
 
-## 11. 结论核对清单
+## 13. 结论核对清单 (v3.0 校准版)
 
 | 编号 | 结论 | 核对状态 | 代码位置 |
 |-----|------|---------|---------|
@@ -549,7 +706,7 @@ reaction(
 | 4 | 应用列表后处理解析图片路径 | ✅ 一致 | `api/application.go:143-145, 445-453` |
 | 5 | 客户端列表后处理清理过期Elevation | ✅ 一致 | `api/client.go:188-192` |
 | 6 | 三类资源均使用 RequireClient 鉴权 | ✅ 一致 | `router/router.go:183-218` |
-| 7 | GET /application/{id}/message 有二次鉴权 | ✅ 一致 | `api/message.go:186` |
+| 7 | GET /application/{id}/message 有二次鉴权，失败返回404 | ✅ 一致 | `api/message.go:186, 194` |
 | 8 | 消息按 id DESC 排序 | ✅ 一致 | `database/message.go:44` |
 | 9 | 应用按 sort_key, id ASC 排序 | ✅ 一致 | `database/application.go:103` |
 | 10 | 客户端无明确排序 | ✅ 一致 | `database/client.go:118` |
@@ -557,10 +714,14 @@ reaction(
 | 12 | 前端 AppStore 支持拖拽排序更新 sortKey | ✅ 一致 | `ui/src/application/AppStore.ts:51-71` |
 | 13 | 前端 ClientStore 显示 elevation 状态 | ✅ 一致 | `ui/src/client/Clients.tsx:137-143` |
 | 14 | 消息图片由前端动态注入 | ✅ 一致 | `ui/src/message/MessagesStore.ts:198-206` |
+| 15 | axios 拦截器不处理 404，直接 reject | ✅ 一致 | `apiAuth.ts:5-23` |
+| 16 | 前端认证通过 Cookie，不通过 header 注入 | ✅ 一致 | `apiAuth.ts` (无请求拦截器) |
+| 17 | 404 时 MessagesStore.loaded 保持 false | ✅ 一致 | `ui/src/message/MessagesStore.ts:49-71` |
+| 18 | 401 触发重新认证，可能登出 | ✅ 一致 | `apiAuth.ts:14-16`, `CurrentUser.ts:109-111` |
 
 ---
 
-## 12. 关键代码位置索引
+## 14. 关键代码位置索引
 
 | 功能 | 文件位置 | 行号 |
 |-----|---------|-----|
@@ -572,11 +733,13 @@ reaction(
 | 客户端列表查询 | `database/client.go` | 42-49 |
 | 应用图片路径解析 | `api/application.go` | 445-453 |
 | 客户端Elevation清理 | `api/client.go` | 188-192 |
-| 应用消息二次鉴权 | `api/message.go` | 186 |
+| 应用消息二次鉴权 | `api/message.go` | 186, 194 |
 | 路由鉴权配置 | `router/router.go` | 183-218 |
 | RequireClient中间件 | `auth/authentication.go` | 52-54 |
+| axios响应拦截器 | `ui/src/apiAuth.ts` | 5-23 |
 | 前端消息分页Store | `ui/src/message/MessagesStore.ts` | 12-223 |
 | 前端通用BaseStore | `ui/src/common/BaseStore.ts` | 14-59 |
 | 前端应用拖拽排序 | `ui/src/application/AppStore.ts` | 51-71 |
 | 前端虚拟滚动实现 | `ui/src/message/Messages.tsx` | 93-107 |
 | 前端状态联动 | `ui/src/reactions.ts` | 7-74 |
+| 前端404加载状态判断 | `ui/src/message/Messages.tsx` | 150 |
