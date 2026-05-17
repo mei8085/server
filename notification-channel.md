@@ -302,22 +302,31 @@ export function notifyNewMessage(msg: IMessage) {
 5. 消息列表、音效、Snackbar 均不受影响
 
 ##### 路径 3：denied → granted（用户在浏览器设置中重新授权）
-**证据链**：`Navigation.tsx:47`（仅初始化时调用一次）
+**证据链**：`browserNotification.ts:18-27`（实时权限检查） + `Navigation.tsx:46-47`（静态 UI 状态）
+
+```typescript
+// browserNotification.ts:18-27 - 每次调用时实时检查权限
+export function notifyNewMessage(msg: IMessage) {
+    const notify = new Notify(msg.title, { ... });
+    notify.show();  // notifyjs 内部实时读取 Notification.permission
+}
+```
 
 1. 用户在浏览器设置中重新授予权限
-2. 由于 `showRequestNotification` 已设为 `false`，侧边栏不会重新显示授权按钮
-3. 但实际上 `notifyNewMessage()` 已可正常工作
-4. **用户需刷新页面才能重新检测到权限状态**
+2. **通知能力立即恢复**：下一条消息到达时，`notifyNewMessage()` 新建 `Notify` 实例，读取到最新的 `granted` 状态，正常显示通知
+3. **UI 按钮状态不一致**：由于 `showRequestNotification` 是 `useState` 初始化值（`Navigation.tsx:47`），仅在组件挂载时调用一次 `mayAllowPermission()`，不会随权限变化自动更新
+4. 侧边栏不会重新显示 "Enable Notifications" 按钮，但通知功能已实际恢复
+5. **无需刷新页面**，通知能力即可正常工作
 
 #### 两类通道在权限切换时的关系
 
 | 权限切换方向 | 浏览器原生通知 | Snackbar 队列 | 统一优先级/互斥 |
 |-------------|--------------|--------------|----------------|
 | prompt → granted | 从无到有，后续消息正常显示 | 始终正常 | 无。Snackbar 不需要权限，两者独立 |
-| granted → denied | 后续消息静默不显示 | 始终正常 | 无。权限仅影响浏览器通知通道 |
-| denied → granted | 需刷新页面后恢复 | 始终正常 | 无。状态同步需要页面刷新 |
+| granted → denied | 后续消息静默不显示（notifyjs 内部拦截） | 始终正常 | 无。权限仅影响浏览器通知通道 |
+| denied → granted | 后续消息立即恢复显示（无需刷新） | 始终正常 | 无。通知能力实时恢复，仅 UI 按钮状态滞后 |
 
-> **关键发现**：浏览器通知与 Snackbar 队列之间无任何权限关联或互斥逻辑。Snackbar 队列完全不依赖浏览器通知权限，任何权限状态下均可正常工作。
+> **关键发现**：浏览器通知与 Snackbar 队列之间无任何权限关联或互斥逻辑。Snackbar 队列完全不依赖浏览器通知权限，任何权限状态下均可正常工作。权限变化时，通知能力的实际表现与 UI 按钮状态可能出现短暂不一致。
 
 ---
 
