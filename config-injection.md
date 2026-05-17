@@ -379,15 +379,15 @@ clientElevated.Use(authentication.RequireElevatedClient)
 
 #### 5.2.2 功能控制方式
 
-客户端管理功能的可用性完全由**认证和权限**决定，与配置项无关：
+客户端管理功能的可用性由**认证、权限和 OIDC 配置**共同决定，并非完全由鉴权单独决定：
 
-| 操作 | 权限要求 |
-|-----|---------|
-| 查看客户端列表 | 登录用户 |
-| 创建客户端 | 登录用户 |
-| 编辑客户端 | 登录用户 |
-| 删除客户端 | 登录用户 + 二次认证（RequireElevation） |
-| 提升客户端权限 | 登录用户 + 二次认证（RequireElevation） |
+| 操作 | 权限要求 | 配置影响 |
+|-----|---------|----------|
+| 查看客户端列表 | 登录用户 | 无 |
+| 创建客户端 | 登录用户 | 无 |
+| 编辑客户端 | 登录用户 | 无 |
+| 删除客户端 | 登录用户 + 二次认证 | 无 |
+| 提升客户端权限 | 登录用户 + 二次认证 | OIDC 开关影响提权流程分支 |
 
 **关键代码**：`ui/src/client/Clients.tsx:28-163`
 
@@ -403,7 +403,36 @@ const Clients = observer(() => {
 });
 ```
 
-> **澄清**：不要将后端 API 的鉴权中间件路径（如 `/client`）误认为是前端界面开关。客户端管理界面本身没有配置开关，其功能限制完全基于用户登录状态和权限等级。
+#### 5.2.3 OIDC 开关对提权流程分支的真实影响
+
+当用户执行需要二次认证的操作时（如删除客户端、提升客户端权限），`ElevationForm 会根据 `oidc` 配置呈现不同的提权选项：
+
+**关键代码**：`ui/src/common/ElevationForm.tsx:13-97`
+
+| OIDC 配置 | 提权流程 | 后端 API |
+|------------|---------|----------|
+| `oidc: false` | 仅显示"Elevate with Password"选项 | `POST /client/:id/elevate`（本地密码认证 |
+| `oidc: true` | 显示两个选项：<br>1. Elevate with Password<br>2. Elevate via OIDC（弹窗方式） | 1. `POST /client/:id/elevate`<br>2. `GET /auth/oidc/elevate` |
+
+**本地密码提权流程：
+```typescript
+// ElevationForm.tsx:21-27
+const handleLocalElevate = async () => {
+    await axios.post(`${config.get('url')}client/${clientId}/elevate`, {durationSeconds});
+};
+```
+
+**OIDC 提权流程：
+```typescript
+// ElevationForm.tsx:47-67
+public oidcElevate = (durationSeconds: number): void => {
+    const url = config.get('url') + 'auth/oidc/elevate?id=' + clientId + '&durationSeconds=' + durationSeconds;
+    this.oidcPopup = window.open(url, 'gotify-oidc-elevate', 'width=600,height=700');
+    // 轮询检查弹窗关闭，完成后刷新用户状态
+};
+```
+
+> **澄清**：不要将后端 API 的鉴权中间件路径（如 `/client`）误认为是前端界面开关。客户端管理界面本身没有配置开关，其功能限制基于用户登录状态、权限等级，以及 OIDC 配置对提权流程的分支选择。
 
 ## 六、完整链路图
 
