@@ -219,7 +219,7 @@ assert.Nil(s.T(), manager.initializeSingleUserPlugin(compat.UserContext{
 - **wrap_test.go** 负责测试 `compat.Wrap()` 层的符号检查失败
 - **manager_test.go** 仅测试了 `nothing` 一个 broken 插件（验证 `loadPlugins()` 的错误传播）
 - **cantinstantiate** 场景通过 mock 插件的错误注入间接测试
-- **cantinstantiate 存在元数据异常**：ModulePath 声明为 `.../broken/noinstance` 与目录名不一致，详见 4.4.1 节分析
+- **cantinstantiate 存在元数据异常**：ModulePath 声明为 `.../broken/noinstance` 与目录名不一致，详见 4.5.1 节分析
 
 ### 4.2 Broken 场景的测试覆盖详情
 
@@ -476,7 +476,7 @@ test-coverage:
 - 生成覆盖率报告上传到 Codecov
 - 插件测试使用构建标签 `//go:build linux || darwin`，仅在 Linux/macOS 上运行（Windows 不支持 Go plugin）
 
-### 4.6 悬挂配置处理的测试
+### 4.7 悬挂配置处理的测试
 
 **悬挂配置**（Dangling Config）指数据库中存在 PluginConf 记录，但对应的插件文件已被删除。
 
