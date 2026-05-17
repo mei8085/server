@@ -65,8 +65,7 @@
 │  1. PRIMARY KEY: id 自增                                                    │
 │  2. UNIQUE INDEX: uix_applications_token (Token 唯一)                       │
 │  3. UNIQUE INDEX: uix_application_user_id_sort_key (UserID+SortKey 唯一)    │
-│  4. FOREIGN KEY: user_id 关联 users 表                                      │
-│  5. 字段长度限制: token varchar(180), sort_key bytes(255)                   │
+│  4. 字段长度限制: token varchar(180), sort_key bytes(255)                   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
