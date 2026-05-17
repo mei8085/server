@@ -672,48 +672,50 @@ func WithUser(ctx *gin.Context, userID uint) {
 3. **模型不匹配**：Go 结构体字段的 json tag 必须与 spec 中的字段名一致
 4. **uint64 问题**：Swagger 2.0 不支持 uint64，生成时会自动替换为 int64
 
-## 8. 三类约束对照清单
+## 8. 三类约束可追溯对照清单
 
-### 8.1 参数约束对照清单
+### 8.1 参数约束对照清单（含完整证据链）
 
-| 约束维度 | Spec 声明示例 | 实现位置 | 当前校验证据 | 未覆盖缺口 | 风险影响 |
-|---------|-------------|---------|-------------|-----------|---------|
-| **查询参数 - limit** | `limit: type=integer, minimum=1, maximum=200, default=100` | `api/message.go:42-45` pagingParams struct | `Test_GetMessages_BadRequestOnInvalidLimit` 验证 limit=555 返回 400 | default=100 未显式验证；边界值 1、200 未单独测试 | 用户传入无效参数时服务行为与文档不一致 |
-| **查询参数 - since** | `since: type=integer, format=int64, minimum=0` | `api/message.go:42-45` pagingParams struct | `Test_GetMessages_WithLimit_WithSince_ReturnsNext` 验证分页逻辑 | since 非法值（负数、非数字）未单独测试 | 无效 since 参数可能导致数据库查询异常 |
-| **路径参数 - id** | `id: type=integer, format=int64, required=true` | `api/user.go:241-291` GetUserByID | `Test_GetUserByID_InvalidID` 验证 id=abc 返回 400；`Test_GetUserByID_UnknownUser` 验证 id=3 返回 404 | id=0、id 超大值等边界未测试 | 无效 ID 可能导致 500 错误而非 400/404 |
-| **请求体 - ApplicationParams** | `body: $ref=#/definitions/ApplicationParams, required=true` | `api/application.go:34-57` ApplicationParams struct | `Test_CreateApplication_mapAllParameters` 验证所有字段映射 | 每个必填字段单独省略的场景未测试 | 部分字段缺失时可能静默失败而非返回 400 |
-| **请求体 - name 必填** | `ApplicationParams.name: required=true` | `api/application.go:44` `binding:"required"` | `Test_CreateApplication_expectBadRequestOnEmptyName`（client 测试中类似） | name 仅含空白字符的场景未测试 | 空白 name 可能创建无效应用 |
-| **请求体 - ClientParams** | `body: $ref=#/definitions/ClientParams, required=true` | `api/client.go:31-42` ClientParams struct | `Test_CreateClient_mapAllParameters` 验证 name 字段 | 其他可能的字段（如 description）未测试 | 额外字段可能被忽略或导致错误 |
-| **FormData - file** | `file: type=file, required=true, in=formData` | `api/application.go:327-379` UploadApplicationImage | 无直接测试 | 文件类型、大小限制未测试 | 恶意文件上传风险 |
-| **FormData - name (login)** | `name: type=string, in=formData, required=true` | `api/session.go:28-98` Login | `Test_Login_Success` 验证完整流程 | name 缺失场景未测试 | 登录时缺少 name 可能导致 500 |
+| 约束维度 | Spec 精确路径 | 实现位置（文件:行号） | 测试用例与断言点 | 未覆盖缺口（可验证表述） | 风险影响 |
+|---------|-------------|----------------------|-----------------|------------------------|---------|
+| **查询参数 - limit** | `$.paths./message.get.parameters[?(@.name=="limit")]` | `api/message.go:42-45` pagingParams.Limit `binding:"min=1,max=200"` | `api/message_test.go:132-139` `Test_GetMessages_BadRequestOnInvalidLimit` → `assert.Equal(400, s.recorder.Code)` | 未验证：不传 limit 时默认值为 100；limit=1 和 limit=200 边界值 | 用户传入 limit>200 时服务行为与文档不一致 |
+| **查询参数 - since** | `$.paths./message.get.parameters[?(@.name=="since")]` | `api/message.go:42-45` pagingParams.Since `binding:"min=0"` | `api/message_test.go:109-130` `Test_GetMessages_WithLimit_WithSince_ReturnsNext` → 验证分页 since 过滤逻辑 | 未验证：since=-1（负数）、since=abc（非数字）的错误处理 | 无效 since 参数可能导致数据库查询异常 |
+| **路径参数 - id (user)** | `$.paths./user/{id}.get.parameters[?(@.name=="id")]` | `api/user.go:241-291` GetUserByID → `withID()` 解析 | `api/user_test.go:89-96` `Test_GetUserByID_InvalidID` → `assert.Equal(400, s.recorder.Code)`; `api/user_test.go:98-106` `Test_GetUserByID_UnknownUser` → `assert.Equal(404, s.recorder.Code)` | 未验证：id=0、id=9223372036854775807（超大值）的边界处理 | 无效 ID 可能导致 500 错误而非 400/404 |
+| **请求体 - ApplicationParams** | `$.paths./application.post.parameters[?(@.name=="body")].schema` | `api/application.go:34-57` ApplicationParams struct | `api/application_test.go:67-86` `Test_CreateApplication_mapAllParameters` → `assert.Equal(expected, app)` 验证所有字段映射 | 未验证：单独省略 name、description、defaultPriority、sortKey 各字段的场景 | 部分必填字段缺失时可能静默失败而非返回 400 |
+| **请求体 - name 必填 (application)** | `$.definitions.ApplicationParams.required` | `api/application.go:44` Name 字段 `binding:"required"` | `api/client_test.go:96-108` `Test_CreateClient_expectBadRequestOnEmptyName` → `assert.Equal(400, s.recorder.Code)`（client 同类测试） | 未验证：name 仅含空白字符（如 `"   "`）的场景 | 空白 name 可能创建无效应用 |
+| **请求体 - ClientParams** | `$.paths./client.post.parameters[?(@.name=="body")].schema` | `api/client.go:31-42` ClientParams struct | `api/client_test.go:66-79` `Test_CreateClient_mapAllParameters` → `assert.Contains(clients, expected)` | 未验证：传入未定义字段（如 description）时的行为 | 额外字段可能被忽略或导致绑定错误 |
+| **FormData - file (upload)** | `$.paths./application/{id}/image.post.parameters[?(@.name=="file")]` | `api/application.go:327-379` UploadApplicationImage → `ctx.FormFile("file")` | **无直接测试** | 未验证：文件类型校验（仅 gif/png/jpg/jpg）、文件大小限制、空文件上传 | 恶意文件上传或超大文件导致服务异常 |
+| **FormData - name (login)** | `$.paths./auth/local/login.parameters[?(@.name=="name")]` | `api/session.go:28-98` Login → `ctx.Bind(&clientParams)` | `api/session_test.go:57-93` `Test_Login_Success` → `assert.Equal("test-browser", clients[0].Name)` | 未验证：不传 name 字段时的错误处理 | 登录时缺少 name 可能导致 500 而非 400 |
 
-### 8.2 响应约束对照清单
+### 8.2 响应约束对照清单（含完整证据链）
 
-| 约束维度 | Spec 声明示例 | 实现位置 | 当前校验证据 | 未覆盖缺口 | 风险影响 |
-|---------|-------------|---------|-------------|-----------|---------|
-| **状态码 - 200 OK** | `200: description=Ok, schema=$ref` | 各 API 成功路径 | 几乎所有测试都验证 200 状态码 | - | 低 |
-| **状态码 - 400 Bad Request** | `400: description=Bad Request, schema=$ref=#/definitions/Error` | `successOrAbort`、参数绑定失败 | `Test_GetMessages_BadRequestOnInvalidLimit`、`Test_GetUserByID_InvalidID` | 所有声明 400 的 API 未全部覆盖 | 用户收到非预期的 500 错误 |
-| **状态码 - 401 Unauthorized** | `401: description=Unauthorized, schema=$ref=#/definitions/Error` | 认证中间件 | 间接通过需要认证的 API 测试 | 显式的无认证测试不完整 | 未认证用户可能访问到敏感数据 |
-| **状态码 - 403 Forbidden** | `403: description=Forbidden, schema=$ref=#/definitions/Error` | 权限不足时返回 | `TestInvalidOrigin` 验证 CORS 拒绝 | 业务逻辑层面的 403 测试不足 | 越权访问风险 |
-| **状态码 - 404 Not Found** | `404: description=Not Found, schema=$ref=#/definitions/Error` | 资源不存在时返回 | `Test_GetUserByID_UnknownUser`、`Test_DeleteClient_expectNotFoundOnCurrentUserIsNotOwner` | 所有声明 404 的 API 未全部覆盖 | 资源不存在时返回 500 而非 404 |
-| **响应模型 - Application** | `schema: $ref=#/definitions/Application` | `model/application.go:5-62` Application struct | `Test_ensureApplicationHasCorrectJsonRepresentation` 精确匹配所有字段 | 嵌套对象、数组响应的完整结构未全部验证 | 响应字段缺失或名称错误导致客户端解析失败 |
-| **响应模型 - PagedMessages** | `schema: $ref=#/definitions/PagedMessages` | `model/paging.go` + `api/message.go:100-119` | `Test_GetMessages_WithLimit_ReturnsNext` 验证分页结构 | paging.next 为空的场景、空消息列表场景未测试 | 分页逻辑错误导致客户端无法正确翻页 |
-| **响应模型 - Error** | `schema: $ref=#/definitions/Error` | `model/error.go` Error struct | 间接验证错误响应包含 error/errorCode/errorDescription | 每个错误场景的 Error 格式未精确验证 | 错误格式不一致导致客户端无法统一处理 |
-| **响应头 - Set-Cookie** | `Set-Cookie: type=string, description=session cookie` | `api/session.go:89` auth.SetCookie | `Test_Login_Success` 验证 cookie 属性（HttpOnly、Path、SameSite） | cookie 过期时间、secure 属性未测试 | 会话安全风险 |
-| **字段只读性 - id/token** | `id: readOnly=true`, `token: readOnly=true` | `model/application.go:16-22` json tag + 业务逻辑 | `Test_CreateClient_ignoresReadOnlyPropertiesInParams` 验证忽略只读字段 | 所有只读字段未逐一验证 | 客户端可能试图修改只读字段导致意外行为 |
+| 约束维度 | Spec 精确路径 | 实现位置（文件:行号） | 测试用例与断言点 | 未覆盖缺口（可验证表述） | 风险影响 |
+|---------|-------------|----------------------|-----------------|------------------------|---------|
+| **状态码 - 200 OK** | 各 API `$.responses.200` | 各 API 成功路径 `ctx.JSON(200, ...)` | 几乎所有测试 → `assert.Equal(200, s.recorder.Code)` | **全覆盖** | 低 |
+| **状态码 - 400 Bad Request** | 各 API `$.responses.400` | `api/internalutil.go:successOrAbort()` + gin binding | `api/message_test.go:132-139` `Test_GetMessages_BadRequestOnInvalidLimit` → 400; `api/user_test.go:89-96` `Test_GetUserByID_InvalidID` → 400 | 未验证：`createApp`、`createClient`、`updateApp` 等 API 的所有 400 场景 | 用户收到非预期的 500 错误 |
+| **状态码 - 401 Unauthorized** | 各 API `$.responses.401` | `auth/authentication.go:abort401()` | `api/message_test.go:67-83` 间接验证（需 `WithUser` 才能成功） | 未验证：每个需要认证的 API 在无认证时都返回 401 | 未认证用户可能访问到敏感数据 |
+| **状态码 - 403 Forbidden** | 各 API `$.responses.403` | `auth/authentication.go:abort403()` | `router/router_test.go:143-170` `TestInvalidOrigin` → `assert.Equal(403, res.StatusCode)` | 未验证：`deleteApp`、`deleteClient` 等需要 elevated 权限的 API 返回 403 | 越权访问风险 |
+| **状态码 - 404 Not Found** | 各 API `$.responses.404` | 各 API 资源不存在时 `ctx.AbortWithError(404, ...)` | `api/user_test.go:98-106` `Test_GetUserByID_UnknownUser` → 404; `api/client_test.go:110-122` `Test_DeleteClient_expectNotFoundOnCurrentUserIsNotOwner` → 404 | 未验证：`getAppMessages`、`deleteApp` 等 API 的 404 场景 | 资源不存在时返回 500 而非 404 |
+| **响应模型 - Application** | `$.definitions.Application` | `model/application.go:5-62` Application struct | `api/application_test.go:88-100` `Test_ensureApplicationHasCorrectJsonRepresentation` → `test.JSONEquals()` 精确匹配所有字段 | 未验证：`getApps` 返回数组时每个元素的完整结构；嵌套对象字段 | 响应字段缺失或名称错误导致客户端解析失败 |
+| **响应模型 - PagedMessages** | `$.paths./message.get.responses.200.schema` | `api/message.go:100-119` `buildWithPaging()` + `model/paging.go` | `api/message_test.go:85-107` `Test_GetMessages_WithLimit_ReturnsNext` → 验证 paging.limit/size/next/since | 未验证：`paging.next` 为空（最后一页）的场景；空消息列表的结构 | 分页逻辑错误导致客户端无法正确翻页 |
+| **响应模型 - Error** | `$.definitions.Error` | `model/error.go` Error struct | 间接验证：错误响应包含 error/errorCode/errorDescription 字段 | 未验证：每个错误场景的 Error 格式完全符合 schema（字段名、类型） | 错误格式不一致导致客户端无法统一处理 |
+| **响应头 - Set-Cookie** | `$.paths./auth/local/login.responses.200.headers.Set-Cookie` | `api/session.go:89` `auth.SetCookie()` | `api/session_test.go:57-93` `Test_Login_Success` → 验证 HttpOnly=true, Path="/", SameSite=Strict | 未验证：cookie 的 Max-Age/Expires 过期时间；Secure 属性（HTTPS 场景） | 会话安全风险 |
+| **字段只读性 - id/token** | `$.definitions.Application.properties.id.readOnly` | `model/application.go:16-22` ID/Token 字段无 form/query tag | `api/client_test.go:81-94` `Test_CreateClient_ignoresReadOnlyPropertiesInParams` → 验证提交 ID/Token 被忽略 | 未验证：Application、User 等模型的所有 readOnly 字段 | 客户端试图修改只读字段导致意外行为 |
 
-### 8.3 鉴权约束对照清单
+### 8.3 鉴权约束对照清单（含完整证据链）
 
-| 约束维度 | Spec 声明示例 | 实现位置 | 当前校验证据 | 未覆盖缺口 | 风险影响 |
-|---------|-------------|---------|-------------|-----------|---------|
-| **Client Token** | `security: [clientTokenHeader, clientTokenQuery, clientTokenAuthorizationHeader, basicAuth]` | `auth/authentication.go:52-54` RequireClient | `Test_GetMessages` 需要 `WithUser` 才能成功 | 三种 token 传递方式未分别测试；basic auth 未测试 | 某种 token 传递方式可能失效 |
-| **Application Token** | `security: [appTokenHeader, appTokenQuery, appTokenAuthorizationHeader]` | `auth/authentication.go:62-76` RequireApplicationToken | 隐式通过消息创建测试 | 三种 token 传递方式未分别测试 | 某种 token 传递方式可能失效 |
-| **Basic Auth** | `security: [basicAuth]` | `api/session.go:28-98` Login 使用 BasicAuth | `Test_Login_Success` 验证 basic auth 登录 | 其他支持 basic auth 的 API 未显式测试 | basic auth 在某些场景下可能不工作 |
-| **Elevated Client** | Requires elevated client (注释中说明) | `auth/authentication.go:57-59` RequireElevatedClient | 间接通过集成测试 | 普通 client 调用 elevated API 被拒绝的场景未直接测试 | 权限提升漏洞 |
-| **Admin 权限** | Requires admin user (注释中说明) | `auth/authentication.go:46-48` RequireAdmin | 无直接测试 | 非 admin 用户调用 admin API 被拒绝的场景未测试 | 越权访问管理功能 |
-| **无认证公开 API** | 无 security 声明 | `/version`、`/health`、`/swagger` | `TestVersionInfo` 无需认证即可访问 | 所有公开 API 未逐一验证 | 本应公开的 API 可能被错误地要求认证 |
-| **Token 类型隔离** | application 端点仅接受 app token | `auth/authentication.go:62-76` RequireApplicationToken | 无直接测试 | 使用 client token 调用 app 端点应被拒绝 | 认证混淆导致安全问题 |
-| **CSRF 保护** | 浏览器场景下的 CSRF 保护 | `auth/cookie.go` SameSite=Strict | `Test_Login_Success` 验证 SameSite 属性 | CSRF 攻击场景未测试 | 跨站请求伪造风险 |
+| 约束维度 | Spec 精确路径 | 实现位置（文件:行号） | 测试用例与断言点 | 未覆盖缺口（可验证表述） | 风险影响 |
+|---------|-------------|----------------------|-----------------|------------------------|---------|
+| **Client Token (header)** | `$.securityDefinitions.clientTokenHeader` + API `$.security` | `auth/authentication.go:52-54` RequireClient → `handleClient()` | `api/message_test.go:67-83` `Test_GetMessages` → 需 `test.WithUser(s.ctx, 5)` 才能返回 200 | 未验证：通过 `X-Gotify-Key` header 传递 token 的场景 | 某种 token 传递方式可能失效 |
+| **Client Token (query)** | `$.securityDefinitions.clientTokenQuery` + API `$.security` | `auth/authentication.go:52-54` RequireClient → `handleClient()` | **无直接测试** | 未验证：通过 `?token=` query 参数传递 client token 的场景 | query 方式传递 token 可能失效 |
+| **Client Token (Authorization)** | `$.securityDefinitions.clientTokenAuthorizationHeader` + API `$.security` | `auth/authentication.go:52-54` RequireClient → `handleClient()` | **无直接测试** | 未验证：通过 `Authorization: Bearer <token>` 传递 client token 的场景 | Authorization 方式传递 token 可能失效 |
+| **Application Token** | `$.securityDefinitions.appTokenHeader` + `$.paths./message.post.security` | `auth/authentication.go:62-76` RequireApplicationToken | `api/message_test.go` 隐式验证（CreateMessage 需要 app token） | 未验证：三种 app token 传递方式（header/query/Authorization）分别测试 | 某种 app token 传递方式可能失效 |
+| **Basic Auth (login)** | `$.paths./auth/local/login.security` | `api/session.go:57-58` Login → `ctx.Request.BasicAuth()` | `api/session_test.go:57-93` `Test_Login_Success` → 使用 `Authorization: Basic <base64>` 成功 | 未验证：其他支持 basic auth 的 API（如 `/user` POST）的 basic auth 场景 | basic auth 在某些 API 上可能不工作 |
+| **Elevated Client** | `$.paths./application/{id}.delete.security` + 注释说明 | `auth/authentication.go:57-59` RequireElevatedClient | 间接通过 `router/router_test.go` 集成测试 | 未验证：普通 non-elevated client 调用 `/client/{id}/elevate`、`/application/{id}` DELETE 等 API 返回 403 | 权限提升漏洞 |
+| **Admin 权限** | `/user` GET/DELETE 等 API 的注释说明 | `auth/authentication.go:46-48` RequireAdmin | **无直接测试** | 未验证：普通 non-admin 用户调用 `/user` GET、`/user/{id}` DELETE 等 API 返回 403 | 越权访问管理功能 |
+| **无认证公开 API** | `/version`, `/health`, `/swagger` 无 `$.security` | `router/router.go:119-123` 无认证中间件 | `router/router_test.go:56-60` `TestVersionInfo` → 无需认证返回 200 | 未验证：`/health`、`/swagger`、`/docs` 等所有公开 API 无需认证 | 本应公开的 API 可能被错误地要求认证 |
+| **Token 类型隔离** | `/message` POST 仅接受 app token（spec security 声明） | `auth/authentication.go:62-76` RequireApplicationToken → 拒绝 user auth | **无直接测试** | 未验证：使用 client token 调用 `/message` POST 返回 403；使用 app token 调用 `/message` GET 返回 403 | 认证混淆导致安全问题 |
+| **CSRF 保护** | 隐式安全要求 | `auth/cookie.go` SameSite=Strict | `api/session_test.go:57-93` `Test_Login_Success` → `assert.Equal(http.SameSiteStrictMode, sessionCookie.SameSite)` | 未验证：跨站请求携带 cookie 时被拒绝的场景 | 跨站请求伪造风险 |
 
 ## 9. 测试夹具覆盖边界分析
 
@@ -802,7 +804,7 @@ func WithUser(ctx *gin.Context, userID uint) {
 | `router/router.go` | 路由注册 |
 | `router/router_test.go` | 集成测试 |
 
-### 8.2 工具版本
+### 11.2 工具版本
 
 - go-swagger: `717e3cb29becaaf00e56953556c6d80f8a01b286`
 - Swagger 规范版本: 2.0
