@@ -205,18 +205,63 @@ assert.Nil(s.T(), manager.initializeSingleUserPlugin(compat.UserContext{
 
 **位置**：`plugin/testing/broken/`
 
-包含 5 种故障场景：
+包含 5 种故障场景，分别由不同测试套件覆盖：
 
-| 目录 | 故障类型 | 对应中断点 |
-|------|----------|------------|
-| `nothing/` | 完全空的插件，无任何导出符号 | 中断点2（缺少 Info 符号） |
-| `noinstance/` | 有 Info 但无 NewGotifyPluginInstance | 中断点4（缺少构造函数） |
-| `unknowninfo/` | Info 函数返回类型错误（string） | 中断点3（Info 签名错误） |
-| `malformedconstructor/` | 构造函数返回类型错误（interface{}） | 中断点5（构造函数签名错误） |
-| `cantinstantiate/` | 插件可加载但 Enable() 始终失败 | 中断点11（启用失败） |
+| 目录 | 故障类型 | 对应中断点 | 测试覆盖 |
+|------|----------|------------|----------|
+| `nothing/` | 完全空的插件，无任何导出符号 | 中断点2（缺少 Info 符号） | ✅ wrap_test + manager_test |
+| `noinstance/` | 有 Info 但无 NewGotifyPluginInstance | 中断点4（缺少构造函数） | ✅ wrap_test |
+| `unknowninfo/` | Info 函数返回类型错误（string） | 中断点3（Info 签名错误） | ✅ wrap_test |
+| `malformedconstructor/` | 构造函数返回类型错误（interface{}） | 中断点5（构造函数签名错误） | ✅ wrap_test |
+| `cantinstantiate/` | 插件可加载但 Enable() 始终失败 | 中断点11（启用失败） | ⚠️ 间接覆盖（通过 mock） |
 
-**在测试中的用法**（`plugin/manager_test.go:175-189`）：
+**注意**：5 个 broken 插件并非全部由 manager_test 覆盖，而是分层测试：
+- **wrap_test.go** 负责测试 `compat.Wrap()` 层的符号检查失败
+- **manager_test.go** 仅测试了 `nothing` 一个 broken 插件（验证 `loadPlugins()` 的错误传播）
+- **cantinstantiate** 场景通过 mock 插件的错误注入间接测试
 
+### 4.2 Broken 场景的测试覆盖详情
+
+#### 4.2.1 wrap_test.go - TestWrapIncompatiblePlugins
+
+**位置**：`plugin/compat/wrap_test.go:132-157`
+
+**覆盖的 broken 场景**：4 个（nothing, noinstance, unknowninfo, malformedconstructor）
+
+**构建方式**：
+```go
+for i, modulePath := range []string{
+    "github.com/gotify/server/v2/plugin/testing/broken/noinstance",
+    "github.com/gotify/server/v2/plugin/testing/broken/nothing",
+    "github.com/gotify/server/v2/plugin/testing/broken/unknowninfo",
+    "github.com/gotify/server/v2/plugin/testing/broken/malformedconstructor",
+} {
+    fName := tmpDir.Path(fmt.Sprintf("broken_%d.so", i))
+    cmd := exec.Command("go", "build", "-buildmode=plugin", "-o="+fName, modulePath)
+    assert.Nil(t, cmd.Run())
+    
+    plugin, err := plugin.Open(fName)
+    assert.Nil(t, err)
+    _, err = Wrap(plugin)
+    assert.Error(t, err)  // 断言点：Wrap() 必须返回错误
+}
+```
+
+**断言点**：`compat.Wrap(plugin)` 返回 `error != nil`
+
+**覆盖的错误类型**：
+- `nothing` → `missing GetGotifyPluginInfo symbol`
+- `noinstance` → `missing NewGotifyPluginInstance symbol`
+- `unknowninfo` → `unknown plugin version (unrecognized GetGotifyPluginInfo signature)`
+- `malformedconstructor` → `NewGotifyPluginInstance signature mismatch`
+
+#### 4.2.2 manager_test.go - TestInitializePlugin_brokenPlugin_expectError
+
+**位置**：`plugin/manager_test.go:175-193`
+
+**覆盖的 broken 场景**：仅 `nothing` 1 个
+
+**构建方式**：
 ```go
 func (s *ManagerSuite) TestInitializePlugin_brokenPlugin_expectError() {
     tmpDir := test.NewTmpDir("gotify_testbrokenplugin")
@@ -232,15 +277,47 @@ func (s *ManagerSuite) TestInitializePlugin_brokenPlugin_expectError() {
 }
 ```
 
-### 4.2 测试用例覆盖的失败场景
+**断言点**：`manager.loadPlugins()` 返回 `error != nil`
 
-`plugin/manager_test.go` 中的 `ManagerSuite` 覆盖了以下失败场景：
+**测试目的**：验证 `Wrap()` 层的错误能够正确向上传播到 `Manager.loadPlugins()`，并被包装为 `pluginFileLoadError`。
+
+#### 4.2.3 cantinstantiate 场景的间接覆盖
+
+`cantinstantiate` 插件（Enable() 失败）没有被直接用于测试，而是通过 mock 插件的错误注入机制间接覆盖：
+
+**覆盖方式**（`plugin/manager_test.go:224-238`）：
+```go
+func (s *ManagerSuite) TestInitializePlugin_alreadyEnabled_cannotEnable_disabledAutomatically() {
+    s.db.NewUserWithName(4, "enable_fail_2")
+    mock.ReturnErrorOnEnableForUser(4, errors.New("test error"))  // 错误注入
+    s.db.CreatePluginConf(&model.PluginConf{
+        UserID:     4,
+        ModulePath: mockPluginPath,
+        Token:      "P5478",
+        Enabled:    true,
+    })
+    
+    assert.Nil(s.T(), s.manager.InitializeForUserID(4))
+    inst := s.getMockPluginInstance(4)
+    assert.False(s.T(), inst.Enabled)  // 断言点：插件被自动禁用
+    assert.False(s.T(), s.getConfForMockPlugin(4).Enabled)
+}
+```
+
+**断言点**：
+- `InitializeForUserID()` 不返回错误（实例级错误不向上传播）
+- 实例 `Enabled` 状态为 `false`
+- 数据库中 `PluginConf.Enabled` 为 `false`
+
+### 4.3 测试用例覆盖的失败场景汇总
+
+**manager_test.go** 中的 `ManagerSuite` 覆盖场景：
 
 | 测试用例 | 覆盖场景 |
 |----------|----------|
 | `TestInitializePlugin_directoryInvalid_expectError` | 插件目录无效 |
 | `TestInitializePlugin_invalidPlugin_expectError` | 非插件文件混入目录 |
-| `TestInitializePlugin_brokenPlugin_expectError` | broken/nothing 插件 |
+| `TestInitializePlugin_brokenPlugin_expectError` | broken/nothing 插件（仅1个） |
 | `TestInitializePlugin_alreadyLoaded_expectError` | 插件重复加载 |
 | `TestInitializePlugin_alreadyEnabledInConf_failedToLoadConfig_disableAutomatically` | 无效 YAML 配置自动禁用 |
 | `TestInitializePlugin_alreadyEnabled_cannotEnable_disabledAutomatically` | Enable() 返回错误自动禁用 |
@@ -251,6 +328,20 @@ func (s *ManagerSuite) TestInitializePlugin_brokenPlugin_expectError() {
 | `TestNewManager_CannotLoadDirectory_expectError` | Manager 初始化目录错误 |
 | `TestNewManager_NonPluginFile_expectError` | 非 .so 文件导致加载失败 |
 | `TestNewManager_InternalApplicationManagement` | 插件卸载后应用标记修正 |
+
+**wrap_test.go** 补充覆盖场景：
+
+| 测试用例 | 覆盖场景 |
+|----------|----------|
+| `TestWrapIncompatiblePlugins` | 4 种符号检查失败场景 |
+
+### 4.4 覆盖缺口分析
+
+| 缺口 | 说明 | 风险 |
+|------|------|------|
+| cantinstantiate 未直接测试 | 该插件存在但未被任何测试直接加载，仅通过 mock 模拟 | 低，mock 已覆盖等价场景 |
+| manager_test 未覆盖全部 wrap 错误类型 | manager_test 仅测试了 nothing，其余 3 种 wrap 错误未在 manager 层验证传播路径 | 中，wrap 层已测试，但 manager 的错误包装逻辑未全量验证 |
+| 缺少 plugin.Open() 失败的专用测试 | 动态链接库加载失败（如文件损坏）通过非 .so 文件间接测试 | 低，`TestNewManager_NonPluginFile_expectError` 已覆盖等价路径 |
 
 ### 4.3 CI 中的测试执行
 
