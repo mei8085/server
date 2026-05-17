@@ -616,7 +616,7 @@ private checkOidcPopup = async () => {
     {"error":"Bad Request","errorCode":400,"errorDescription":"Field 'id' is required"}
     ```
   - 这是原始 JSON，没有格式化，用户体验差
-  - 主窗口**无法读取弹窗内容**（即使是同源，也需要弹窗主动通信）
+  - **当前实现中主窗口未尝试读取弹窗内容**
 
 **阶段二：提升回调错误（`/auth/oidc/callback`）**
 
@@ -627,18 +627,26 @@ private checkOidcPopup = async () => {
     ```
     client not found
     ```
-  - 主窗口同样无法读取弹窗内容
+  - **当前实现中主窗口未尝试读取弹窗内容**
 
 **阶段三：弹窗关闭后的主窗口处理**
 
 - 主窗口轮询检查弹窗是否关闭
-- 无论弹窗中发生了什么错误，主窗口都**无法获取具体错误信息**
+- **当前实现**：无论弹窗中发生了什么错误，主窗口都不会尝试从弹窗读取错误信息
 - 如果弹窗关闭但未提升成功，主窗口只显示通用错误：
   ```
   OIDC elevation was not completed.
   ```
 
-**✅ 校正结论**：OIDC 提升流程不是全程纯文本。入口错误显示 JSON（用户体验差），回调错误显示纯文本，两者都不会传递到主窗口。
+**📌 技术可行性校正**：
+- ❌ **不是技术上不可行**：同源弹窗的 DOM 和 `window` 对象在技术上是可以访问的（`window.opener` 可用于通信）
+- ⚠️ **当前未实现回传机制**：当前代码没有建立任何通信机制（如 `postMessage`、轮询弹窗 URL、或注入脚本主动上报）
+- ⚠️ **存在现实约束**：
+  - OIDC provider 页面是跨域的，无法访问其内容
+  - 回调成功时会自动执行 `window.close()`，主窗口可能来不及读取
+  - 弹窗错误页面是后端直接返回的静态内容，没有与主窗口通信的脚本
+
+**✅ 校正结论**：OIDC 提升流程不是全程纯文本。入口错误显示 JSON（用户体验差），回调错误显示纯文本。当前实现未建立回传机制，但技术上（同源场景下）存在改进空间。
 
 #### 5.3.4 链路 C（健康检查）- ⚠️ 格式不匹配
 
@@ -665,7 +673,7 @@ axios.get('/health')
 | **OIDC 登录错误体验** | 出错时显示浏览器默认纯文本页面，用户体验差，无法返回应用 | 🔴 高 |
 | **OIDC 提升入口错误** | 参数错误时弹窗内显示原始 JSON，用户无法理解 | 🔴 高 |
 | **OIDC 提升回调错误** | 弹窗内显示纯文本错误，用户体验差 | 🟡 中 |
-| **OIDC 提升错误不透明** | 主窗口无法获取弹窗中的具体错误，只能显示通用提示 | 🟡 中 |
+| **OIDC 提升错误不透明** | 当前实现中主窗口不读取弹窗错误，只能显示通用提示 | 🟡 中 |
 | **健壮性** | 多种错误处理路径，增加了维护复杂度 | 🟡 中 |
 | **健康检查兼容性** | 如果 UI 将来调用健康检查，500 时会显示 `undefined: undefined` | 🟡 中 |
 | **国际化** | 硬编码的英文错误信息难以进行多语言支持 | 🟡 中 |
@@ -717,7 +725,14 @@ responses:
 | `GET /auth/oidc/callback` | Error 模型 | 纯文本 | ❌ 不一致 |
 
 - ⚠️ 需要处理两种错误格式：提升入口是 JSON，登录入口和回调是纯文本
-- ⚠️ 回调错误显示在浏览器/弹窗中，应用无法通过 JS 获取
+- ⚠️ 回调错误显示在浏览器/弹窗中
+- 📌 **技术可行性校正**：
+  - ❌ **不是绝对无法通过 JS 获取**：技术上有多种可能的方案
+  - ⚠️ **但各有约束**：
+    1. **弹窗轮询 URL 方案**：如果回调在同源下，可以通过 `popup.location.href` 读取 URL 中的错误参数（但当前错误不在 URL 中）
+    2. **postMessage 方案**：需要后端在错误页面注入脚本主动向 opener 发送消息（当前未实现）
+    3. **服务端轮询方案**：可以创建一个临时的提升会话，主窗口通过 API 轮询状态（当前未设计）
+    4. **重定向携带参数方案**：后端错误时重定向到前端页面并在 query 中携带错误（当前直接返回纯文本）
 - ❌ 文档与实现部分不一致
 
 #### 6.2.3 系统集成（System Integration）- 调用业务 API
@@ -811,33 +826,57 @@ def handle_response(response: requests.Response) -> Dict[str, Any]:
         error_description=f"Response: {json.dumps(data)[:200]}"
     )
 
-# OIDC 提升流程示例
-def elevate_with_oidc(client_id: int, duration_seconds: int):
+# OIDC 提升流程示例（Web 应用集成）
+def integrate_oidc_elevation_web(client_id: int, duration_seconds: int):
     """
-    OIDC 提升流程注意事项：
-    1. 提升入口 /auth/oidc/elevate 返回标准 Error JSON
-    2. 回调 /auth/oidc/callback 返回纯文本错误
-    3. 回调错误显示在浏览器中，应用无法通过 API 获取
+    Web 应用集成 OIDC 提升流程的说明：
+    
+    当前实现限制：
+    1. 提升入口 /auth/oidc/elevate 返回标准 Error JSON（可通过 API 调用获取错误）
+    2. 回调 /auth/oidc/callback 返回纯文本错误（显示在弹窗中）
+    3. 回调错误无法通过 API 直接获取，因为回调是浏览器跳转
+    
+    技术上可行的改进方向（需要后端配合）：
+    A. 后端在错误时重定向到前端页面并携带 error 参数
+    B. 后端在错误页面注入 postMessage 脚本向主窗口发送错误
+    C. 后端创建临时错误会话，前端通过 API 轮询获取
+    
+    当前推荐的集成方式：
+    - 先通过 API 调用提升入口验证参数正确性
+    - 如果参数验证失败，直接显示错误给用户
+    - 如果参数验证成功，打开弹窗让用户完成 OIDC 认证
+    - 弹窗关闭后，通过 API 检查是否提升成功
+    - 如果未成功，提示用户检查弹窗中显示的错误信息
     """
     base_url = "https://gotify.example.com"
     
-    # 阶段一：调用提升入口（可能返回 Error JSON）
+    # 阶段一：先通过 API 验证参数（可选，提前捕获参数错误）
     try:
+        # 注意：这会消耗一个 state，如果直接打开弹窗可能导致 state 不一致
+        # 实际集成时建议直接打开弹窗，让参数错误在弹窗中显示
         response = requests.get(
             f"{base_url}/auth/oidc/elevate",
-            params={"id": client_id, "durationSeconds": duration_seconds}
+            params={"id": client_id, "durationSeconds": duration_seconds},
+            allow_redirects=False  # 不跟随重定向
         )
-        handle_response(response)  # 如果入口出错，抛出 GotifyApiError
-        authorize_url = response.url  # 重定向到 OIDC provider 的 URL
-        print(f"请在浏览器中访问: {authorize_url}")
+        # 如果是 302 重定向说明参数验证通过
+        if response.status_code == 302:
+            authorize_url = response.headers['Location']
+            print(f"请在浏览器中访问: {authorize_url}")
+        else:
+            # 非 302 说明有错误，尝试解析 Error 模型
+            handle_response(response)
     except GotifyApiError as e:
-        print(f"提升入口错误: {e.error_code} - {e.error}")
+        print(f"参数错误: {e.error_code} - {e.error}")
         print(f"详情: {e.error_description}")
         return False
     
-    # 阶段二：用户在浏览器中完成认证
-    # 回调错误会显示在浏览器中，应用无法捕获
-    # 需要用户手动确认是否成功
+    # 阶段二：用户在浏览器/弹窗中完成认证
+    # 回调错误会显示在浏览器中，应用无法通过 API 获取
+    # 建议在 UI 中提示用户：如果发生错误，错误信息会显示在弹窗中
+    
+    # 阶段三：验证是否提升成功
+    # 通过用户信息 API 检查是否已提升
     
     return True
 
@@ -864,6 +903,7 @@ except GotifyOIDCError as e:
 | **集成复杂度** | 需要处理三种不同的错误响应格式（Error JSON / Health JSON / text/plain） | 🔴 高 |
 | **文档一致性** | OIDC 登录入口和回调的 Swagger 文档与实际响应不符，误导接入方 | 🔴 高 |
 | **OIDC 提升入口** | 文档与实现一致，返回标准 Error JSON，处理简单 | ✅ 无问题 |
+| **回调错误回传** | 当前实现未建立回传机制，但技术上存在改进空间（需要后端配合） | 🟡 中 |
 | **错误恢复** | 链路 A：401 可触发刷新 token，400 需检查参数，500 需重试 | 🟡 中 |
 | **版本兼容性** | 错误结构稳定，但错误信息文本可能随版本变化，依赖字符串匹配较脆弱 | 🟡 中 |
 | **监控告警** | 链路 A：可基于 `errorCode` 分类统计；健康检查需检查响应体字段 | ✅ 好 |
@@ -916,7 +956,7 @@ func (a *OIDCAPI) LoginHandler() gin.HandlerFunc {
 
 ```go
 // 出错时不直接返回错误，而是重定向回 UI 并在 query 中携带错误信息
-func callbackError(w http.ResponseWriter, errMsg string, status int) {
+func callbackError(w http.ResponseWriter, r *http.Request, errMsg string, status int) {
     redirectURL := fmt.Sprintf("../../?error=%s&status=%d", 
         url.QueryEscape(errMsg), status)
     http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
@@ -926,15 +966,58 @@ func callbackError(w http.ResponseWriter, errMsg string, status int) {
 **优点**：
 - 用户不会看到纯文本错误页面或原始 JSON
 - UI 可以统一处理错误显示
+- 前端可以通过 URL 参数获取错误信息
 
-#### 方案 C：OIDC 提升弹窗使用 postMessage 通信
+#### 方案 C：OIDC 弹窗错误页面注入 postMessage 脚本
 
-如果后端不便修改，可以在前端改进弹窗通信：
+如果后端不便改为 JSON，可以在纯文本错误页面中注入脚本：
+
+```go
+func callbackError(w http.ResponseWriter, errMsg string, status int) {
+    // 返回 HTML 页面而不是纯文本
+    w.Header().Set("Content-Type", "text/html; charset=utf-8")
+    w.WriteHeader(status)
+    fmt.Fprintf(w, `
+<!DOCTYPE html>
+<html>
+<head><title>Error</title></head>
+<body>
+    <h1>%s</h1>
+    <p>%s</p>
+    <script>
+        // 向主窗口发送错误信息
+        if (window.opener) {
+            window.opener.postMessage({
+                type: 'oidc-error',
+                status: %d,
+                message: %q
+            }, '*');
+        }
+    </script>
+</body>
+</html>`, http.StatusText(status), errMsg, status, errMsg)
+}
+```
+
+**前端配合**：
 
 ```typescript
-// 弹窗关闭前向主窗口发送错误信息
-// 在弹窗页面中注入脚本，在错误时通过 postMessage 发送错误
+// 在主窗口监听错误消息
+window.addEventListener('message', (event) => {
+    if (event.data && event.data.type === 'oidc-error') {
+        snack(`OIDC Error: ${event.data.message}`);
+        // 关闭弹窗
+        if (this.oidcPopup) {
+            this.oidcPopup.close();
+        }
+    }
+});
 ```
+
+**优点**：
+- 前端可以主动获取错误信息
+- 用户体验更好
+- 不需要大幅修改后端架构
 
 ### 7.2 前端 OIDC 提升错误提示改进
 
@@ -1102,18 +1185,28 @@ if (status === 400 || status === 403 || status === 500) {
 
 **✅ 重要校正**：OIDC 提升流程**不是全程 text/plain**。入口阶段返回标准 Error JSON，只有回调阶段才返回纯文本。
 
-### 8.2 两类调用链路的本质区别
+### 8.2 OIDC 弹窗错误传递校正
+
+| 维度 | 说明 |
+|------|------|
+| **当前实现** | 主窗口仅轮询检查弹窗是否关闭，不尝试读取弹窗中的任何错误信息 |
+| **绝对判断修正** | 不是"无法通过 JS 获取"，而是"当前未建立回传机制" |
+| **技术可行性** | 同源场景下技术上可行（可通过 `postMessage`、URL 参数、服务端轮询等方式实现） |
+| **现实约束** | 1. OIDC provider 页面跨域无法访问；2. 成功时弹窗会自动关闭；3. 当前错误页面没有通信脚本 |
+| **改进方向** | 需要后端配合，在错误时重定向到前端或注入通信脚本 |
+
+### 8.3 两类调用链路的本质区别
 
 | 维度 | Axios API 链路（链路 A） | 浏览器跳转/弹窗链路（链路 B） |
 |------|-------------------------|-----------------------------|
 | **调用方式** | `axios.get/post()` | `<a href>` / `window.open()` |
 | **错误格式** | `model.Error` JSON | 登录入口+回调: text/plain；提升入口: Error JSON |
 | **经过拦截器** | ✅ 是 | ❌ 否 |
-| **错误处理** | 前端统一拦截、格式化显示 | 浏览器直接渲染 / 主窗口无法获取 |
-| **用户体验** | 错误以 snackbar 形式友好展示 | 跳转时显示纯文本/JSON，弹窗错误不透明 |
+| **错误处理** | 前端统一拦截、格式化显示 | 浏览器直接渲染 / 当前未建立回传机制 |
+| **用户体验** | 错误以 snackbar 形式友好展示 | 跳转时显示纯文本/JSON，弹窗错误当前不透明 |
 | **占比** | ~95% 接口 + OIDC 提升入口 | OIDC 登录入口 + 所有回调 |
 
-### 8.3 优点
+### 8.4 优点
 
 1. **Axios API 结构统一**：绝大多数 API 错误响应使用相同的 JSON 结构
 2. **OIDC 提升入口规范**：提升入口返回标准 Error 模型，与文档一致
@@ -1121,19 +1214,20 @@ if (status === 400 || status === 403 || status === 500) {
 4. **HTTP 友好**：错误码与 HTTP 语义一致
 5. **调试便利**：`errorDescription` 提供详细上下文（标准 API）
 
-### 8.4 不足（按严重程度排序）
+### 8.5 不足（按严重程度排序）
 
 1. 🔴 **OIDC 登录入口错误体验差**：出错时显示纯文本页面
 2. 🔴 **OIDC 提升入口错误显示原始 JSON**：用户无法理解
-3. 🔴 **OIDC 回调错误纯文本**：用户体验差，主窗口无法捕获
+3. 🔴 **OIDC 回调错误纯文本**：用户体验差
 4. 🔴 **文档与实现部分不一致**：OIDC 登录入口和回调的 Swagger 文档错误
-5. 🟡 **响应模型不统一**：三种不同的错误响应格式，增加客户端集成复杂度
-6. 🟡 **错误信息不统一**：相同类型错误的描述文本不一致
-7. 🟡 **缺少业务错误码**：第三方接入方难以精确判断错误类型
-8. 🟡 **敏感信息暴露**：500 错误直接返回内部错误详情
-9. 🟡 **国际化困难**：硬编码英文错误信息
+5. 🟡 **OIDC 提升错误不透明**：当前未建立回传机制，但技术上可行
+6. 🟡 **响应模型不统一**：三种不同的错误响应格式，增加客户端集成复杂度
+7. 🟡 **错误信息不统一**：相同类型错误的描述文本不一致
+8. 🟡 **缺少业务错误码**：第三方接入方难以精确判断错误类型
+9. 🟡 **敏感信息暴露**：500 错误直接返回内部错误详情
+10. 🟡 **国际化困难**：硬编码英文错误信息
 
-### 8.5 关键文件速查
+### 8.6 关键文件速查
 
 | 文件 | 职责 |
 |------|------|
@@ -1146,5 +1240,5 @@ if (status === 400 || status === 403 || status === 500) {
 | `router/router.go` | 中间件注册、路由定义 |
 | `auth/authentication.go` | 认证相关错误抛出 |
 | `ui/src/apiAuth.ts` | 前端 axios 错误拦截器（仅 axios 请求） |
-| `ui/src/ElevateStore.ts` | OIDC 提升流程的弹窗管理 |
+| `ui/src/ElevateStore.ts` | OIDC 提升流程的弹窗管理（当前仅轮询关闭状态，不读取错误） |
 | `ui/src/user/Login.tsx` | OIDC 登录按钮 |
