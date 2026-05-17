@@ -1,6 +1,6 @@
 # 分页模型与列表查询复用方式分析报告
 
-> 版本: v3.0 (事实校准版)
+> 版本: v4.0 (鉴权路径校准版)
 > 核对状态: ✅ 所有结论已逐段与代码核对
 
 ---
@@ -171,28 +171,112 @@ func (a *ClientAPI) GetClients(ctx *gin.Context) {
 
 ---
 
-## 5. 鉴权约束差异分析
+## 5. 鉴权体系完整分析
 
-### 5.1 路由层面鉴权 (`router/router.go`)
+### 5.1 认证方式与适用范围
 
-| 接口 | 路由组 | 鉴权中间件 | 说明 |
-|-----|-------|-----------|------|
-| `GET /message` | `clientAuth` | `RequireClient` | 客户端token或Basic Auth |
-| `GET /application/{id}/message` | `clientAuth` | `RequireClient` | 客户端token或Basic Auth |
-| `GET /application` | `clientAuth` | `RequireClient` | 客户端token或Basic Auth |
-| `GET /client` | `clientAuth` | `RequireClient` | 客户端token或Basic Auth |
+系统支持 **4种认证方式**，按优先级排序 (`auth/authentication.go:205-216`):
 
-**鉴权中间件层级**:
+| 认证方式 | 优先级 | 适用场景 | 说明 |
+|---------|-------|---------|------|
+| Query 参数 `token` | 1 | 所有接口 | `?token=xxx` |
+| Header `X-Gotify-Key` | 2 | 所有接口 | 主要用于API调用 |
+| Header `Authorization: Bearer` | 3 | 所有接口 | OAuth2风格 |
+| Cookie `gotify-client-token` | 4 | 所有接口 | 浏览器会话 |
+| Basic Auth | 5 | 用户接口 | `Authorization: Basic base64(user:pass)` |
+
+**重要区分**:
+- **应用Token** (`ApplicationToken`): 仅用于 `POST /message` 发送消息
+- **客户端Token** (`ClientToken`): 用于用户登录后的所有操作（列表查询、删除等）
+- **Basic Auth**: 用于登录、Elevation等敏感操作
+
+✅ **核对结论**: 与代码完全一致，`readTokenFromRequest` 函数明确了优先级
+
+---
+
+### 5.2 路由层面鉴权对比 (`router/router.go`)
+
+| 接口 | 路由组 | 鉴权中间件 | 接受的认证方式 |
+|-----|-------|-----------|--------------|
+| `POST /message` (发送消息) | 根路由 | `RequireApplicationToken` | 应用Token (X-Gotify-Key 或 Cookie) |
+| `GET /message` (查询消息) | `clientAuth` | `RequireClient` | 客户端Token + Basic Auth |
+| `GET /application/{id}/message` | `clientAuth` | `RequireClient` | 客户端Token + Basic Auth |
+| `GET /application` | `clientAuth` | `RequireClient` | 客户端Token + Basic Auth |
+| `GET /client` | `clientAuth` | `RequireClient` | 客户端Token + Basic Auth |
+
+✅ **核对结论**: 与代码一致:
+- `POST /message`: `router/router.go:181`
+- 列表接口: `router/router.go:183-218`
+
+---
+
+### 5.3 列表查询接口鉴权路径 (RequireClient)
+
+**位置**: `auth/authentication.go:52-54`
+
 ```
 RequireClient
-├── handleUser()  # Basic Auth 认证
-└── handleClient() # Client Token 认证
-    └── (无额外检查)
+├── handleUser()         # 尝试 Basic Auth 认证
+│   └── 成功 → 注册用户信息，继续请求
+└── handleClient()       # 尝试客户端Token认证
+    ├── 读取Token (优先级: Query > X-Gotify-Key > Bearer > Cookie)
+    ├── 数据库验证ClientToken
+    ├── 成功 → 注册客户端信息，更新LastUsed，续期Cookie
+    └── 失败 → 返回 401
 ```
 
-✅ **核对结论**: 与代码一致，路由定义在 `router/router.go:183-218`
+**✅ 列表查询接口的实际认证方式**:
+- 前端浏览器环境: 通过 **Cookie** (`gotify-client-token`) 自动认证
+- API调用环境: 可通过 **X-Gotify-Key header** 传递客户端Token
+- 都支持: Basic Auth (用户名密码)
 
-### 5.2 Handler 内部二次鉴权
+✅ **核对结论**: 与代码完全一致
+
+---
+
+### 5.4 发送消息接口鉴权路径 (RequireApplicationToken)
+
+**位置**: `auth/authentication.go:61-76`
+
+```
+RequireApplicationToken
+├── handleApplication()  # 尝试应用Token认证
+│   ├── 读取Token (优先级: Query > X-Gotify-Key > Bearer > Cookie)
+│   ├── 数据库验证ApplicationToken
+│   └── 成功 → 注册应用信息，继续请求
+└── 如果用户认证成功 → 返回 403 (不允许用户认证发送消息)
+    └── 如果无认证 → 返回 401
+```
+
+**✅ 发送消息接口的实际认证方式**:
+- 仅接受 **应用Token** (ApplicationToken)
+- 前端发送消息时: 手动设置 `X-Gotify-Key: ${app.token}` header (`ui/src/message/MessagesStore.ts:151`)
+- 不接受: 客户端Token、Cookie、Basic Auth
+
+✅ **核对结论**: 与代码完全一致
+
+---
+
+### 5.5 X-Gotify-Key 的正确使用场景
+
+| 场景 | 是否使用 X-Gotify-Key | 代码位置 |
+|-----|----------------------|---------|
+| 前端发送消息 (`sendMessage`) | ✅ 是，设置 `X-Gotify-Key: ${app.token}` | `ui/src/message/MessagesStore.ts:151` |
+| 前端列表查询 (消息/应用/客户端) | ❌ 否，通过 Cookie 自动认证 | 无代码 |
+| 前端登录 (`login`) | ❌ 否，使用 Basic Auth header | `ui/src/CurrentUser.ts:58` |
+| 前端Elevation (`elevate`) | ❌ 否，使用 Basic Auth header | `ui/src/ElevateStore.ts:40` |
+| API 调用发送消息 | ✅ 是，推荐使用方式 | 文档 `docs/package.go:10` |
+| API 调用列表查询 | ✅ 是，可传递客户端Token | 文档 `docs/package.go:40` |
+
+**❌ 之前版本的错误修正**:
+- 错误: "所有列表请求通过 `apiAuth.ts` 注入 `X-Gotify-Key` header"
+- 正确: 列表查询不注入 header，通过 Cookie 自动认证；仅发送消息时手动设置 header
+
+✅ **核对结论**: 已验证所有使用场景
+
+---
+
+### 5.6 Handler 内部二次鉴权
 
 | 接口 | 内部鉴权逻辑 | 位置 | 失败返回 |
 |-----|-------------|------|---------|
@@ -200,14 +284,15 @@ RequireClient
 | `GET /application/{id}/message` | ✅ 检查应用归属: `app.UserID == auth.GetUserID(ctx)` | `api/message.go:186` | 404 |
 | `GET /application` | ❌ 无 (数据库查询已按 user_id 过滤) | - | - |
 | `GET /client` | ❌ 无 (数据库查询已按 user_id 过滤) | - | - |
+| `POST /message` | ❌ 无 (应用Token已关联应用) | - | - |
 
-> **重要修正**: `GET /application/{id}/message` 鉴权失败返回 **404** (不是 403)，目的是隐藏应用存在性信息。
+> **重要说明**: `GET /application/{id}/message` 鉴权失败返回 **404** (不是 403)，目的是隐藏应用存在性信息。
 
 ✅ **核对结论**: 与代码一致，`api/message.go:194` 明确返回 404
 
 ---
 
-### 5.3 数据库层面权限过滤
+### 5.7 数据库层面权限过滤
 
 | 资源 | 权限过滤方式 | SQL 条件 |
 |-----|-------------|----------|
@@ -381,17 +466,29 @@ export const initAxios = (currentUser: CurrentUser, snack: SnackReporter) => {
 
 ---
 
-### 8.2 认证机制说明
+### 8.2 前端认证机制说明
 
 **❌ 错误描述修正**: 之前版本提到"所有列表请求通过 `apiAuth.ts` 注入 `X-Gotify-Key` header" —— 这是错误的。
 
 **✅ 实际认证机制**:
-- 前端不通过 header 注入 token
-- 认证通过 **Cookie** 实现：登录时服务器设置 `gotify-client-token` cookie
-- 浏览器自动在后续请求中携带 cookie
-- `apiAuth.ts` 只配置了响应拦截器，**没有配置请求拦截器**
+1. **登录流程**:
+   - 前端调用 `POST /auth/local/login`，使用 Basic Auth header (`CurrentUser.ts:58`)
+   - 后端验证成功后创建 ClientToken，通过 `Set-Cookie` 设置 `gotify-client-token` (`auth/cookie.go:12-19`)
+   - 浏览器自动在后续请求中携带 cookie
 
-✅ **核对结论**: `apiAuth.ts` 中确实没有请求拦截器，只有响应拦截器
+2. **日常操作 (列表查询等)**:
+   - 浏览器自动携带 cookie，无需前端设置 header
+   - 后端 `handleClient()` 从 cookie 读取 token 并验证
+
+3. **发送消息**:
+   - 前端手动设置 `X-Gotify-Key: ${app.token}` header (`MessagesStore.ts:151`)
+   - 后端 `handleApplication()` 验证应用 token
+
+4. **敏感操作 (Elevation)**:
+   - 前端使用 Basic Auth header (`ElevateStore.ts:40`)
+   - 后端 `handleUser()` 验证用户名密码
+
+✅ **核对结论**: 已完整追踪认证流程
 
 ---
 
@@ -411,7 +508,7 @@ export const initAxios = (currentUser: CurrentUser, snack: SnackReporter) => {
 ```
 1. Messages.tsx: useEffect 调用 messagesStore.loadMore(9999)
 2. MessagesStore.loadMore(): 调用 fetchMessages(9999, 0)
-3. axios.get() → 收到 404 响应
+3. axios.get() → 收到 404 响应 (通过Cookie认证，无需额外header)
 4. apiAuth.ts 拦截器: 404 不在处理范围内，直接 Promise.reject(error)
 5. MessagesStore.loadMore(): 
    - try 块被跳过 (没有 catch)
@@ -442,7 +539,7 @@ export const initAxios = (currentUser: CurrentUser, snack: SnackReporter) => {
 1. axios 请求收到 401
 2. apiAuth.ts 拦截器: 调用 currentUser.tryAuthenticate()
 3. CurrentUser.tryAuthenticate():
-   - 再次请求 /current/user
+   - 再次请求 /current/user (通过Cookie)
    - 如果失败且状态码 4xx → 调用 logout()
 4. logout() 设置 loggedIn = false
 5. Layout.tsx 中 RequireAuth 组件重定向到 /login
@@ -474,12 +571,32 @@ export const initAxios = (currentUser: CurrentUser, snack: SnackReporter) => {
 
 ---
 
+### 9.4 发送消息 401 场景
+
+**触发条件**: 应用 token 无效或已被删除
+
+**前端响应链**:
+```
+1. MessagesStore.sendMessage() 调用 axios.post()
+2. 设置 X-Gotify-Key: ${app.token} header
+3. 收到 401 响应
+4. apiAuth.ts 拦截器: 401 处理，调用 tryAuthenticate()
+5. 显示 "Could not complete request." snack
+6. Promise.reject(error)，sendMessage 没有 catch
+7. 用户看到 snack 提示，但消息未发送
+```
+
+✅ **核对结论**: 与代码一致 (`MessagesStore.ts:137-154`)
+
+---
+
 ## 10. 对前端 Store 状态的影响
 
 ### 10.1 鉴权约束传导到前端
 
 **路由鉴权 → 前端状态**:
-- 通过 Cookie 自动携带认证信息
+- 通过 Cookie 自动携带认证信息（列表查询）
+- 发送消息手动设置 X-Gotify-Key header
 - 401 触发重新认证流程，最终可能登出
 - 登出触发所有 store 清空 (`reactions.ts:42-44`)
 
@@ -555,6 +672,7 @@ class AppStore extends BaseStore<IApplication> {
 **与后端交互**:
 - `sortKey` 字段用于持久化用户自定义排序
 - 图片路径已由后端解析，前端直接使用
+- `token` 字段用于发送消息时设置 X-Gotify-Key header
 
 ✅ **核对结论**: 与代码一致，`reorder()` 在 `ui/src/application/AppStore.ts:51-71`
 
@@ -577,7 +695,7 @@ class ClientStore extends BaseStore<IClient> {
 
 **与后端交互**:
 - `elevatedUntil` 由后端清理过期值，前端无需处理
-- 前端可触发 `elevate()` 操作，更新后刷新列表
+- 前端可触发 `elevate()` 操作，使用 Basic Auth，更新后刷新列表
 
 ✅ **核对结论**: 与代码一致，`elevate()` 在 `ui/src/client/ClientStore.ts:43-51`
 
@@ -655,6 +773,7 @@ reaction(
 - **分页处理函数 (`withPaging`, `buildWithPaging`)**: 仅用于消息API
 - **鉴权中间件**: `RequireClient` 被三类资源列表接口复用
 - **权限过滤模式**: 三类资源均使用 `user_id` 过滤，但实现方式不同 (JOIN vs WHERE)
+- **Token 读取逻辑**: `readTokenFromRequest` 被所有认证中间件复用
 
 ✅ **核对结论**: 与代码一致
 
@@ -696,7 +815,7 @@ reaction(
 
 ---
 
-## 13. 结论核对清单 (v3.0 校准版)
+## 13. 结论核对清单 (v4.0 鉴权校准版)
 
 | 编号 | 结论 | 核对状态 | 代码位置 |
 |-----|------|---------|---------|
@@ -705,19 +824,23 @@ reaction(
 | 3 | 分页使用 Limit+1 判断下一页，避免COUNT | ✅ 一致 | `api/message.go:92, 188` |
 | 4 | 应用列表后处理解析图片路径 | ✅ 一致 | `api/application.go:143-145, 445-453` |
 | 5 | 客户端列表后处理清理过期Elevation | ✅ 一致 | `api/client.go:188-192` |
-| 6 | 三类资源均使用 RequireClient 鉴权 | ✅ 一致 | `router/router.go:183-218` |
-| 7 | GET /application/{id}/message 有二次鉴权，失败返回404 | ✅ 一致 | `api/message.go:186, 194` |
-| 8 | 消息按 id DESC 排序 | ✅ 一致 | `database/message.go:44` |
-| 9 | 应用按 sort_key, id ASC 排序 | ✅ 一致 | `database/application.go:103` |
-| 10 | 客户端无明确排序 | ✅ 一致 | `database/client.go:118` |
-| 11 | 前端 MessagesStore 维护分页状态 | ✅ 一致 | `ui/src/message/MessagesStore.ts:12-223` |
-| 12 | 前端 AppStore 支持拖拽排序更新 sortKey | ✅ 一致 | `ui/src/application/AppStore.ts:51-71` |
-| 13 | 前端 ClientStore 显示 elevation 状态 | ✅ 一致 | `ui/src/client/Clients.tsx:137-143` |
-| 14 | 消息图片由前端动态注入 | ✅ 一致 | `ui/src/message/MessagesStore.ts:198-206` |
-| 15 | axios 拦截器不处理 404，直接 reject | ✅ 一致 | `apiAuth.ts:5-23` |
-| 16 | 前端认证通过 Cookie，不通过 header 注入 | ✅ 一致 | `apiAuth.ts` (无请求拦截器) |
-| 17 | 404 时 MessagesStore.loaded 保持 false | ✅ 一致 | `ui/src/message/MessagesStore.ts:49-71` |
-| 18 | 401 触发重新认证，可能登出 | ✅ 一致 | `apiAuth.ts:14-16`, `CurrentUser.ts:109-111` |
+| 6 | 三类资源列表接口均使用 RequireClient 鉴权 | ✅ 一致 | `router/router.go:183-218` |
+| 7 | 发送消息接口使用 RequireApplicationToken 鉴权 | ✅ 一致 | `router/router.go:181` |
+| 8 | GET /application/{id}/message 有二次鉴权，失败返回404 | ✅ 一致 | `api/message.go:186, 194` |
+| 9 | 消息按 id DESC 排序 | ✅ 一致 | `database/message.go:44` |
+| 10 | 应用按 sort_key, id ASC 排序 | ✅ 一致 | `database/application.go:103` |
+| 11 | 客户端无明确排序 | ✅ 一致 | `database/client.go:118` |
+| 12 | 前端 MessagesStore 维护分页状态 | ✅ 一致 | `ui/src/message/MessagesStore.ts:12-223` |
+| 13 | 前端 AppStore 支持拖拽排序更新 sortKey | ✅ 一致 | `ui/src/application/AppStore.ts:51-71` |
+| 14 | 前端 ClientStore 显示 elevation 状态 | ✅ 一致 | `ui/src/client/Clients.tsx:137-143` |
+| 15 | 消息图片由前端动态注入 | ✅ 一致 | `ui/src/message/MessagesStore.ts:198-206` |
+| 16 | axios 拦截器不处理 404，直接 reject | ✅ 一致 | `apiAuth.ts:5-23` |
+| 17 | 前端列表查询通过 Cookie 认证，不注入 X-Gotify-Key | ✅ 一致 | `apiAuth.ts` (无请求拦截器) |
+| 18 | 前端发送消息时手动设置 X-Gotify-Key header | ✅ 一致 | `ui/src/message/MessagesStore.ts:151` |
+| 19 | 404 时 MessagesStore.loaded 保持 false | ✅ 一致 | `ui/src/message/MessagesStore.ts:49-71` |
+| 20 | 401 触发重新认证，可能登出 | ✅ 一致 | `apiAuth.ts:14-16`, `CurrentUser.ts:109-111` |
+| 21 | 认证方式优先级: Query > X-Gotify-Key > Bearer > Cookie | ✅ 一致 | `auth/authentication.go:205-216` |
+| 22 | Basic Auth 用于登录和Elevation操作 | ✅ 一致 | `CurrentUser.ts:58`, `ElevateStore.ts:40` |
 
 ---
 
@@ -734,9 +857,15 @@ reaction(
 | 应用图片路径解析 | `api/application.go` | 445-453 |
 | 客户端Elevation清理 | `api/client.go` | 188-192 |
 | 应用消息二次鉴权 | `api/message.go` | 186, 194 |
-| 路由鉴权配置 | `router/router.go` | 183-218 |
+| 路由鉴权配置 | `router/router.go` | 181, 183-218 |
 | RequireClient中间件 | `auth/authentication.go` | 52-54 |
+| RequireApplicationToken中间件 | `auth/authentication.go` | 61-76 |
+| Token读取优先级 | `auth/authentication.go` | 205-216 |
+| Cookie设置 | `auth/cookie.go` | 12-19 |
 | axios响应拦截器 | `ui/src/apiAuth.ts` | 5-23 |
+| 前端登录 (Basic Auth) | `ui/src/CurrentUser.ts` | 46-75 |
+| 前端发送消息 (X-Gotify-Key) | `ui/src/message/MessagesStore.ts` | 137-154 |
+| 前端Elevation (Basic Auth) | `ui/src/ElevateStore.ts` | 37-45 |
 | 前端消息分页Store | `ui/src/message/MessagesStore.ts` | 12-223 |
 | 前端通用BaseStore | `ui/src/common/BaseStore.ts` | 14-59 |
 | 前端应用拖拽排序 | `ui/src/application/AppStore.ts` | 51-71 |
