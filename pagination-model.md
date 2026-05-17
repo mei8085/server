@@ -175,22 +175,31 @@ func (a *ClientAPI) GetClients(ctx *gin.Context) {
 
 ### 5.1 认证方式与适用范围
 
-系统支持 **4种认证方式**，按优先级排序 (`auth/authentication.go:205-216`):
+系统支持 **5种认证方式**，分为两类：
 
-| 认证方式 | 优先级 | 适用场景 | 说明 |
-|---------|-------|---------|------|
-| Query 参数 `token` | 1 | 所有接口 | `?token=xxx` |
-| Header `X-Gotify-Key` | 2 | 所有接口 | 主要用于API调用 |
-| Header `Authorization: Bearer` | 3 | 所有接口 | OAuth2风格 |
-| Cookie `gotify-client-token` | 4 | 所有接口 | 浏览器会话 |
-| Basic Auth | 5 | 用户接口 | `Authorization: Basic base64(user:pass)` |
+**A. Token 传递方式 (4种，按优先级排序)**
+**位置**: `auth/authentication.go:205-216` (`readTokenFromRequest` 函数)
 
-**重要区分**:
+| 传递方式 | 优先级 | 说明 |
+|---------|-------|------|
+| Query 参数 `token` | 1 | `?token=xxx` |
+| Header `X-Gotify-Key` | 2 | 主要用于API调用 |
+| Header `Authorization: Bearer` | 3 | OAuth2风格 |
+| Cookie `gotify-client-token` | 4 | 浏览器会话 |
+
+> **重要说明**: 上述4种是 Token 的**传递方式**，不是独立的认证方式。同一个 Token 可以通过任意一种方式传递。
+
+**B. 独立认证方式 (1种)**
+
+| 认证方式 | 适用场景 | 说明 |
+|---------|---------|------|
+| Basic Auth | 用户认证 | `Authorization: Basic base64(user:pass)`，用于登录、Elevation等 |
+
+**Token 类型区分**:
 - **应用Token** (`ApplicationToken`): 仅用于 `POST /message` 发送消息
 - **客户端Token** (`ClientToken`): 用于用户登录后的所有操作（列表查询、删除等）
-- **Basic Auth**: 用于登录、Elevation等敏感操作
 
-✅ **核对结论**: 与代码完全一致，`readTokenFromRequest` 函数明确了优先级
+✅ **核对结论**: 与代码完全一致
 
 ---
 
