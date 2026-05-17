@@ -207,18 +207,19 @@ assert.Nil(s.T(), manager.initializeSingleUserPlugin(compat.UserContext{
 
 包含 5 种故障场景，分别由不同测试套件覆盖：
 
-| 目录 | 故障类型 | 对应中断点 | 测试覆盖 |
-|------|----------|------------|----------|
-| `nothing/` | 完全空的插件，无任何导出符号 | 中断点2（缺少 Info 符号） | ✅ wrap_test + manager_test |
-| `noinstance/` | 有 Info 但无 NewGotifyPluginInstance | 中断点4（缺少构造函数） | ✅ wrap_test |
-| `unknowninfo/` | Info 函数返回类型错误（string） | 中断点3（Info 签名错误） | ✅ wrap_test |
-| `malformedconstructor/` | 构造函数返回类型错误（interface{}） | 中断点5（构造函数签名错误） | ✅ wrap_test |
-| `cantinstantiate/` | 插件可加载但 Enable() 始终失败 | 中断点11（启用失败） | ⚠️ 间接覆盖（通过 mock） |
+| 目录 | 故障类型 | 对应中断点 | 测试覆盖 | 备注 |
+|------|----------|------------|----------|------|
+| `nothing/` | 完全空的插件，无任何导出符号 | 中断点2（缺少 Info 符号） | ✅ wrap_test + manager_test | |
+| `noinstance/` | 有 Info 但无 NewGotifyPluginInstance | 中断点4（缺少构造函数） | ✅ wrap_test | |
+| `unknowninfo/` | Info 函数返回类型错误（string） | 中断点3（Info 签名错误） | ✅ wrap_test | |
+| `malformedconstructor/` | 构造函数返回类型错误（interface{}） | 中断点5（构造函数签名错误） | ✅ wrap_test | |
+| `cantinstantiate/` | 插件可加载但 Enable() 始终失败 | 中断点11（启用失败） | ⚠️ 间接覆盖（通过 mock） | ⚠️ ModulePath 元数据错误（指向 noinstance） |
 
 **注意**：5 个 broken 插件并非全部由 manager_test 覆盖，而是分层测试：
 - **wrap_test.go** 负责测试 `compat.Wrap()` 层的符号检查失败
 - **manager_test.go** 仅测试了 `nothing` 一个 broken 插件（验证 `loadPlugins()` 的错误传播）
 - **cantinstantiate** 场景通过 mock 插件的错误注入间接测试
+- **cantinstantiate 存在元数据异常**：ModulePath 声明为 `.../broken/noinstance` 与目录名不一致，详见 4.4.1 节分析
 
 ### 4.2 Broken 场景的测试覆盖详情
 
@@ -343,7 +344,119 @@ func (s *ManagerSuite) TestInitializePlugin_alreadyEnabled_cannotEnable_disabled
 | manager_test 未覆盖全部 wrap 错误类型 | manager_test 仅测试了 nothing，其余 3 种 wrap 错误未在 manager 层验证传播路径 | 中，wrap 层已测试，但 manager 的错误包装逻辑未全量验证 |
 | 缺少 plugin.Open() 失败的专用测试 | 动态链接库加载失败（如文件损坏）通过非 .so 文件间接测试 | 低，`TestNewManager_NonPluginFile_expectError` 已覆盖等价路径 |
 
-### 4.5 CI 中的测试执行
+### 4.5 cantinstantiate 夹具的元数据异常专项分析
+
+#### 4.5.1 证据：ModulePath 与目录名不一致
+
+通过代码比对可以确认元数据异常的存在：
+
+**cantinstantiate 目录下的声明**（`plugin/testing/broken/cantinstantiate/main.go:10-14`）：
+```go
+func GetGotifyPluginInfo() plugin.Info {
+    return plugin.Info{
+        ModulePath: "github.com/gotify/server/v2/plugin/testing/broken/noinstance",
+        //                                                              ^^^^^^^^^^
+        // 实际目录是 cantinstantiate/，此处错误地声明为 noinstance/
+    }
+}
+```
+
+**noinstance 目录下的声明**（`plugin/testing/broken/noinstance/main.go:8-12`）：
+```go
+func GetGotifyPluginInfo() plugin.Info {
+    return plugin.Info{
+        ModulePath: "github.com/gotify/server/v2/plugin/testing/broken/noinstance",
+        //                                                              ^^^^^^^^^^
+        // 与目录名一致，声明正确
+    }
+}
+```
+
+**结论**：两个不同目录下的插件声明了**完全相同的 ModulePath**，`cantinstantiate` 的元数据与其实际存放位置不一致。
+
+#### 4.5.2 对失败分类口径的影响
+
+1. **故障类型映射混乱**
+   - 按设计意图：`cantinstantiate` → 中断点11（Enable() 失败），`noinstance` → 中断点4（缺少构造函数）
+   - 实际效果：两者 ModulePath 相同，系统无法通过 modulePath 区分故障类型
+   - 后果：失败分类统计时，"Enable() 失败"的样本可能被错误地归类到"缺少构造函数"
+
+2. **模块路径重复检测的二义性**
+   - 如果同时构建并加载这两个插件，`LoadPlugin()` 会触发重复检测错误：
+     ```
+     plugin with module path .../broken/noinstance is present at least twice
+     ```
+   - 此时无法区分是"同一插件被意外加载两次"还是"两个不同插件元数据冲突"
+   - 失败分级会被误判为"插件级错误"（模块路径重复），而掩盖了真正的"实例级错误"（Enable() 失败）
+
+3. **数据库关联失效**
+   - `PluginConf.ModulePath` 是关联数据库配置与插件实例的外键
+   - 相同的 modulePath 会导致 `cantinstantiate` 的配置被错误地应用到 `noinstance` 上
+   - 配置验证失败的错误日志会指向错误的故障类型
+
+#### 4.5.3 对按目录复现的理解成本影响
+
+1. **复现路径与预期不符**
+   - 开发者意图："我要复现 cantinstantiate 的 Enable() 失败场景"
+   - 操作：`go build -buildmode=plugin ./plugin/testing/broken/cantinstantiate`
+   - 结果：系统中注册的 modulePath 是 `.../broken/noinstance`
+   - 理解成本：开发者需要额外理解"目录名 ≠ modulePath"的映射关系
+
+2. **故障排查误导**
+   - CI 报错：`plugin .../broken/noinstance is present at least twice`
+   - 排查路径：开发者检查 `broken/noinstance/` 目录 → 无异常 → 困惑
+   - 真正原因：`broken/cantinstantiate/` 也声明了相同的 modulePath
+   - 排查成本：从"直接关联"变为"需要遍历所有插件检查元数据"
+
+3. **测试覆盖统计失真**
+   - 统计脚本：按 modulePath 统计每个故障类型的测试覆盖
+   - 结果：`noinstance` 被统计为"已覆盖"，但 `cantinstantiate` 的 Enable() 失败场景未被统计
+   - 决策误导：管理者可能误以为"Enable() 失败场景已被真实插件测试覆盖"，而实际上是 mock 间接覆盖
+
+#### 4.5.4 对测试可读性的影响
+
+1. **代码意图模糊**
+   - 新读者看到 `cantinstantiate/main.go` 会疑惑："为什么这个目录叫 cantinstantiate，但 ModulePath 指向 noinstance？"
+   - 可能的误解：这是 noinstance 的别名、变体、或废弃版本
+   - 需要额外的上下文才能理解：这是一个复制粘贴错误
+
+2. **文档与代码不一致**
+   - 本文档 4.1.2 节的表格明确标注：`cantinstantiate` → 中断点11（Enable() 失败）
+   - 但代码层面的元数据不支持这个映射关系
+   - 可信度降低：读者可能怀疑文档的准确性
+
+3. **调试信息不可靠**
+   - 日志中打印的 `modulePath` 无法唯一标识插件
+   - 断点调试时，`PluginInfo()` 返回的信息与实际加载的文件不匹配
+   - 增加调试时的认知负担
+
+#### 4.5.5 测试建议与取舍理由
+
+**可选方案对比**：
+
+| 方案 | 具体操作 | 对现有测试的影响 | 维护成本 | 推荐度 |
+|------|----------|------------------|----------|--------|
+| **方案 1：修正元数据** | 将 `cantinstantiate/main.go:12` 的 ModulePath 改为 `.../broken/cantinstantiate` | 无影响（该插件未被任何测试直接加载） | 极低（改一行代码） | ⭐⭐⭐⭐⭐ |
+| **方案 2：保持现状 + 文档标注** | 不修改代码，仅在文档中说明此异常 | 无影响 | 低（但持续产生理解成本） | ⭐⭐ |
+| **方案 3：新增测试覆盖冲突场景** | 保持元数据异常，新增测试专门验证"两个不同插件声明相同 modulePath 时的系统行为" | 无影响，但增加测试代码 | 中（新增约 30 行测试代码） | ⭐⭐⭐ |
+| **方案 4：修正元数据 + 新增冲突测试** | 先修正元数据，再构造两个临时测试插件验证 modulePath 重复检测逻辑 | 无影响 | 中高 | ⭐⭐⭐⭐ |
+
+**推荐方案 1（修正元数据）**，核心理由：
+
+1. **ROI 最高**：仅需修改一行代码，零测试影响，永久消除理解成本
+2. **符合最小惊讶原则**：目录名与 modulePath 保持一致是最自然的约定
+3. **不破坏现有测试**：cantinstantiate 目前未被任何测试直接加载，修改后不会导致测试失败
+4. **为未来铺路**：如果后续需要新增测试直接覆盖 cantinstantiate 场景，元数据正确是前提
+
+**不推荐方案 2（仅文档标注）**的理由：
+- 文档标注只能缓解问题，不能从根源消除
+- 每次有新开发者接触代码都会产生同样的困惑
+- 长期维护成本高于一次性修复
+
+**可选补充方案 4**：
+如果团队认为"modulePath 重复检测"逻辑本身需要测试覆盖，可以在修正元数据后，专门构造两个临时测试插件（例如在测试代码中动态生成）来验证冲突检测，而不是依赖这个历史遗留的 bug 作为测试用例。
+
+### 4.6 CI 中的测试执行
 
 **CI 配置**（`.github/workflows/build.yml`）：
 
