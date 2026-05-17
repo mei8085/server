@@ -305,16 +305,18 @@ func (a *SessionAPI) Login(ctx *gin.Context) {
 | 用户名 claim 缺失 | 500 | `http.Error`，纯文本错误 | 否 | `resolveUser` 失败，`pendingSession` **未消费** | oidc.go:204-208 |
 | 用户不存在且自动注册关闭 | 403 | `http.Error`，纯文本错误 | 否 | `resolveUser` 失败，`pendingSession` **未消费** | oidc.go:204-208 |
 | 用户创建数据库错误 | 500 | `http.Error`，纯文本错误 | 否 | `resolveUser` 失败，`pendingSession` **未消费** | oidc.go:204-208 |
-| State 无效或已过期 | 400 | `http.Error`，纯文本错误 | 否 | **用户可能已创建**（resolveUser 在 popPendingSession 之前），`pendingSession` 未消费 | oidc.go:209-213 |
+| State 无效（Map 中不存在） | 400 | `http.Error`，纯文本错误 | 否 | **用户可能已创建**（resolveUser 在 popPendingSession 之前），`pendingSession` **未消费**（Pop 返回 false） | oidc.go:209-213, 435-441 |
+| State 有效但已过期（存在但超时） | 400 | `http.Error`，纯文本错误 | 否 | **用户可能已创建**（resolveUser 在 popPendingSession 之前），`pendingSession` **已消费**（Pop 已从 Map 删除，后因超时而返回失败） | oidc.go:209-213, 435-441 |
 | Client 创建数据库错误 | 500 | `http.Error`，纯文本错误 | 否 | 用户已创建，`pendingSession` 已消费 | oidc.go:220-224 |
 
 **OIDC 浏览器回调失败特点：**
 - 所有失败均返回纯文本错误信息（非 JSON）
 - 失败时不会设置 Cookie
-- **重要**：执行顺序导致副作用差异：
+- **重要**：执行顺序 `resolveUser` → `popPendingSession` 导致副作用差异：
   - `resolveUser` 前失败（令牌交换、用户信息获取）：`pendingSession` 未消费
   - `resolveUser` 失败：用户未创建，`pendingSession` **未消费**
-  - State 校验失败：**用户可能已创建**，`pendingSession` 未消费
+  - State 无效：**用户可能已创建**，`pendingSession` **未消费**（Pop 返回 false）
+  - State 有效但已过期：**用户可能已创建**，`pendingSession` **已消费**（Pop 已删除但超时）
   - Client 创建失败：用户已创建，`pendingSession` 已消费
 
 #### OIDC 原生应用 Token 交换失败场景
