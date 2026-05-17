@@ -199,7 +199,209 @@ window.addEventListener('beforeunload', stores.messagesStore.executePendingDelet
 | 消息创建与通知 | `api/message.go` | 363-385 |
 | 优先级视觉映射 | `ui/src/message/Message.tsx` | 107-115 |
 
-## 九、总结
+## 十、边界场景深度分析
+
+### 10.1 多标签页并发场景
+
+#### 服务端分发机制
+**证据链**：`api/stream/stream.go:82-91`
+
+```go
+func (a *API) Notify(userID uint, msg *model.MessageExternal) {
+    a.lock.RLock()
+    defer a.lock.RUnlock()
+    if clients, ok := a.clients[userID]; ok {
+        for _, c := range clients {
+            c.write <- msg
+        }
+    }
+}
+```
+
+- 服务端维护 `map[uint][]*client`，同一用户的所有连接并列存储
+- 每个标签页建立独立 WebSocket 连接（`stream.go:154` 中 `register(client)`）
+- 消息遍历所有连接发送，**无标签页去重逻辑**
+
+#### 前端多实例隔离
+**证据链**：`ui/src/index.tsx:28-51`
+
+```typescript
+const initStores = (): StoreMapping => {
+    const snackManager = new SnackManager();
+    const wsStore = new WebSocketStore(snackManager.snack, currentUser);
+    // ... 每个标签页创建独立的 Store 实例
+};
+```
+
+- 每个标签页初始化独立的 Store 实例树
+- 无 `BroadcastChannel`、`localStorage` 跨标签页同步机制
+- 各标签页独立调用 `wsStore.listen()` 注册回调
+
+#### 两类通道行为对比
+
+| 通道类型 | 重复触发情况 | 互斥/优先级关系 | 证据链 |
+|---------|-------------|----------------|--------|
+| **浏览器原生通知** | ✗ **会重复触发**。N 个标签页收到同一条消息，会显示 N 条系统通知 | 无统一优先级/互斥。各标签页独立显示，由操作系统通知中心管理 | `reactions.ts:25` → `browserNotification.ts:18-27` → 浏览器 Notification API |
+| **Snackbar 队列** | ✗ **会重复触发**（仅操作反馈场景）。每个标签页独立显示操作结果 | 无统一优先级/互斥。各标签页 Snackbar 栈独立 | `SnackManager.ts:7-11` → `notistack` 内部队列 |
+| **消息列表** | ✓ 各标签页独立维护，数据库层面保证消息唯一 | 无跨标签页同步 | `MessagesStore.ts:74-81` → MobX observable 状态 |
+
+> **关键发现**：浏览器原生通知和 Snackbar 队列在多标签页场景下完全隔离，无任何跨页协调机制。同一用户打开 N 个标签页，将收到 N 条重复的浏览器通知。
+
+---
+
+### 10.2 通知权限在 granted/prompt/denied 间切换
+
+#### 权限检测的静态性
+**证据链**：`ui/src/layout/Navigation.tsx:46-47`
+
+```typescript
+const [showRequestNotification, setShowRequestNotification] =
+    React.useState(mayAllowPermission);
+```
+
+- `mayAllowPermission()` **仅在组件初始化时调用一次**
+- 未监听 `Notification.permission` 的 `change` 事件
+- 权限状态切换后，UI 不会自动响应
+
+#### 三种切换路径的行为分析
+
+##### 路径 1：prompt → granted（用户主动授权）
+**证据链**：`Navigation.tsx:100-106` → `browserNotification.ts:9-16`
+
+```typescript
+<Button
+    onClick={() => {
+        requestPermission();
+        setShowRequestNotification(false);
+    }}>
+    Enable Notifications
+</Button>
+```
+
+1. 用户点击侧边栏 "Enable Notifications" 按钮
+2. 调用 `Notify.requestPermission()` 触发浏览器权限弹窗
+3. 用户授权后，`Notification.permission` 变为 `granted`
+4. 按钮消失（`setShowRequestNotification(false)`）
+5. **后续消息正常触发浏览器通知**
+6. Snackbar 队列不受影响，继续正常工作
+
+##### 路径 2：granted → denied（用户在浏览器设置中撤销权限）
+**证据链**：`browserNotification.ts:18-27`
+
+```typescript
+export function notifyNewMessage(msg: IMessage) {
+    const notify = new Notify(msg.title, { ... });
+    notify.show();  // notifyjs 内部检查权限
+}
+```
+
+1. 用户在浏览器设置中拒绝通知权限
+2. 前端无感知，继续调用 `notifyNewMessage()`
+3. `notifyjs` 内部检测到权限为 `denied`，静默失败
+4. **浏览器通知不显示，但无错误抛出**
+5. 消息列表、音效、Snackbar 均不受影响
+
+##### 路径 3：denied → granted（用户在浏览器设置中重新授权）
+**证据链**：`Navigation.tsx:47`（仅初始化时调用一次）
+
+1. 用户在浏览器设置中重新授予权限
+2. 由于 `showRequestNotification` 已设为 `false`，侧边栏不会重新显示授权按钮
+3. 但实际上 `notifyNewMessage()` 已可正常工作
+4. **用户需刷新页面才能重新检测到权限状态**
+
+#### 两类通道在权限切换时的关系
+
+| 权限切换方向 | 浏览器原生通知 | Snackbar 队列 | 统一优先级/互斥 |
+|-------------|--------------|--------------|----------------|
+| prompt → granted | 从无到有，后续消息正常显示 | 始终正常 | 无。Snackbar 不需要权限，两者独立 |
+| granted → denied | 后续消息静默不显示 | 始终正常 | 无。权限仅影响浏览器通知通道 |
+| denied → granted | 需刷新页面后恢复 | 始终正常 | 无。状态同步需要页面刷新 |
+
+> **关键发现**：浏览器通知与 Snackbar 队列之间无任何权限关联或互斥逻辑。Snackbar 队列完全不依赖浏览器通知权限，任何权限状态下均可正常工作。
+
+---
+
+### 10.3 重连期间重复消息
+
+#### WebSocket 重连机制
+**证据链**：`ui/src/message/WebSocketStore.ts:32-48`
+
+```typescript
+ws.onclose = () => {
+    this.wsActive = false;
+    this.currentUser.tryAuthenticate()
+        .then(() => {
+            this.snack('WebSocket connection closed, trying again in 30 seconds.');
+            setTimeout(() => this.listen(callback), 30000);
+        });
+};
+```
+
+- 连接断开后，30 秒后自动重连
+- 重连时重新调用 `listen(callback)`，创建新的 WebSocket 连接
+- **服务端无消息补发机制**：WebSocket 握手不携带 `since` 或 `lastMessageId` 参数
+
+#### 消息丢失与重复的可能性分析
+
+##### 场景 A：连接断开瞬间的消息丢失
+**证据链**：`api/stream/client.go:95-99`
+
+```go
+c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+if err := writeJSON(c.conn, message); err != nil {
+    printWebSocketError("WriteError", err)
+    return  // 写入失败直接返回，消息丢弃
+}
+```
+
+- 服务端写入 WebSocket 失败时直接丢弃消息
+- 无重试队列、无持久化未确认消息
+- 重连后**不会补发**丢失的消息
+- 浏览器通知和 Snackbar 均不会收到这些消息
+
+##### 场景 B：应用层重试导致的重复消息
+**证据链**：`api/message.go:363-385`
+
+```go
+func (a *MessageAPI) CreateMessage(ctx *gin.Context) {
+    // ... 每次调用 CreateMessage 生成新的消息 ID
+    msgInternal := toInternalMessage(&message)
+    a.DB.CreateMessage(msgInternal)  // 写入数据库，生成唯一 ID
+    a.Notifier.Notify(auth.GetUserID(ctx), toExternalMessage(msgInternal))
+}
+```
+
+- 如果发送方（应用）因网络超时重试，会创建**多条不同 ID 的消息**
+- 每条消息都独立触发浏览器通知和消息列表更新
+- 从用户视角看是重复通知，但系统认为是独立消息
+- **无应用层去重机制**（如基于消息内容哈希去重）
+
+##### 场景 C：前端重连后的消息去重检查
+**证据链**：`ui/src/message/MessagesStore.ts:74-81`
+
+```typescript
+publishSingleMessage(message: IMessage) {
+    if (this.exists(AllMessages)) {
+        this.stateOf(AllMessages).messages.unshift(message);  // 直接插入，不检查 ID
+    }
+}
+```
+
+- 直接 `unshift` 到列表头部，**不检查消息 ID 是否已存在**
+- 浏览器通知也直接调用，无去重逻辑
+- 如果因网络异常导致服务端重复推送同 ID 消息（理论上不会发生），前端会重复显示
+
+#### 两类通道在重连期间的行为
+
+| 通道类型 | 重连期间重复触发可能性 | 互斥/优先级关系 | 证据链 |
+|---------|----------------------|----------------|--------|
+| **浏览器原生通知** | ✓ 可能重复。应用层重试会导致多条通知 | 无统一优先级。每条通知独立显示 | `reactions.ts:25` → `browserNotification.ts:18-27` |
+| **Snackbar 队列** | ✗ 不会因消息重复触发。仅在连接断开时显示一次「重连中」提示 | 无。Snackbar 与消息推送是独立事件流 | `WebSocketStore.ts:32-48` → `SnackManager.ts:7-11` |
+| **消息列表** | ✓ 可能重复。应用层重试会导致多条消息记录 | 无。按时间倒序排列 | `MessagesStore.ts:74-81` → 数据库独立 ID |
+
+> **关键发现**：重连期间的重复风险主要来自应用层重试，而非 WebSocket 本身。浏览器通知和消息列表都会呈现为多条独立消息，Snackbar 队列则不受消息重复影响，仅在连接状态变化时触发。
+
+## 十一、总结
 
 Gotify 管理界面的通知系统采用「分层降级」设计：
 
@@ -207,4 +409,12 @@ Gotify 管理界面的通知系统采用「分层降级」设计：
 2. **次高优先级**：高优先级消息音效提醒，确保及时感知
 3. **便利性功能**：浏览器原生通知和 Snackbar 提供即时视觉反馈，但不作为可靠通知保证
 
-这种设计在保障核心功能可靠性的同时，充分利用浏览器能力提供良好的用户体验，异常场景下有清晰的降级路径。
+### 边界场景核心结论
+
+| 边界场景 | 浏览器原生通知行为 | Snackbar 队列行为 | 统一协调机制 |
+|---------|------------------|------------------|-------------|
+| 多标签页并发 | 每个标签页独立触发，N 页显示 N 条 | 每个标签页独立显示操作反馈 | 无。完全隔离 |
+| 权限状态切换 | 受权限影响，静默失败无提示 | 完全不受权限影响 | 无。两者独立 |
+| 重连期间 | 应用层重试会导致重复通知 | 仅连接状态变化时触发 | 无。独立事件流 |
+
+这种设计在保障核心功能可靠性的同时，充分利用浏览器能力提供良好的用户体验，异常场景下有清晰的降级路径，但在多标签页协调和权限动态响应方面存在优化空间。
