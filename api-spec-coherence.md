@@ -674,18 +674,18 @@ func WithUser(ctx *gin.Context, userID uint) {
 
 ## 8. 三类约束可追溯对照清单
 
-### 8.1 参数约束对照清单（含完整证据链）
+### 8.1 参数约束对照清单（含完整证据链与验证步骤）
 
-| 约束维度 | Spec 精确路径 | 实现位置（文件:行号） | 测试用例与断言点 | 未覆盖缺口（可验证表述） | 风险影响 |
-|---------|-------------|----------------------|-----------------|------------------------|---------|
-| **查询参数 - limit** | `$.paths./message.get.parameters[?(@.name=="limit")]` | `api/message.go:42-45` pagingParams.Limit `binding:"min=1,max=200"` | `api/message_test.go:132-139` `Test_GetMessages_BadRequestOnInvalidLimit` → `assert.Equal(400, s.recorder.Code)` | 未验证：不传 limit 时默认值为 100；limit=1 和 limit=200 边界值 | 用户传入 limit>200 时服务行为与文档不一致 |
-| **查询参数 - since** | `$.paths./message.get.parameters[?(@.name=="since")]` | `api/message.go:42-45` pagingParams.Since `binding:"min=0"` | `api/message_test.go:109-130` `Test_GetMessages_WithLimit_WithSince_ReturnsNext` → 验证分页 since 过滤逻辑 | 未验证：since=-1（负数）、since=abc（非数字）的错误处理 | 无效 since 参数可能导致数据库查询异常 |
-| **路径参数 - id (user)** | `$.paths./user/{id}.get.parameters[?(@.name=="id")]` | `api/user.go:241-291` GetUserByID → `withID()` 解析 | `api/user_test.go:89-96` `Test_GetUserByID_InvalidID` → `assert.Equal(400, s.recorder.Code)`; `api/user_test.go:98-106` `Test_GetUserByID_UnknownUser` → `assert.Equal(404, s.recorder.Code)` | 未验证：id=0、id=9223372036854775807（超大值）的边界处理 | 无效 ID 可能导致 500 错误而非 400/404 |
-| **请求体 - ApplicationParams** | `$.paths./application.post.parameters[?(@.name=="body")].schema` | `api/application.go:34-57` ApplicationParams struct | `api/application_test.go:67-86` `Test_CreateApplication_mapAllParameters` → `assert.Equal(expected, app)` 验证所有字段映射 | 未验证：单独省略 name、description、defaultPriority、sortKey 各字段的场景 | 部分必填字段缺失时可能静默失败而非返回 400 |
-| **请求体 - name 必填 (application)** | `$.definitions.ApplicationParams.required` | `api/application.go:44` Name 字段 `binding:"required"` | `api/client_test.go:96-108` `Test_CreateClient_expectBadRequestOnEmptyName` → `assert.Equal(400, s.recorder.Code)`（client 同类测试） | 未验证：name 仅含空白字符（如 `"   "`）的场景 | 空白 name 可能创建无效应用 |
-| **请求体 - ClientParams** | `$.paths./client.post.parameters[?(@.name=="body")].schema` | `api/client.go:31-42` ClientParams struct | `api/client_test.go:66-79` `Test_CreateClient_mapAllParameters` → `assert.Contains(clients, expected)` | 未验证：传入未定义字段（如 description）时的行为 | 额外字段可能被忽略或导致绑定错误 |
-| **FormData - file (upload)** | `$.paths./application/{id}/image.post.parameters[?(@.name=="file")]` | `api/application.go:327-379` UploadApplicationImage → `ctx.FormFile("file")` | **无直接测试** | 未验证：文件类型校验（仅 gif/png/jpg/jpg）、文件大小限制、空文件上传 | 恶意文件上传或超大文件导致服务异常 |
-| **FormData - name (login)** | `$.paths./auth/local/login.parameters[?(@.name=="name")]` | `api/session.go:28-98` Login → `ctx.Bind(&clientParams)` | `api/session_test.go:57-93` `Test_Login_Success` → `assert.Equal("test-browser", clients[0].Name)` | 未验证：不传 name 字段时的错误处理 | 登录时缺少 name 可能导致 500 而非 400 |
+| 约束维度 | Spec 精确路径 | 实现位置（文件:行号） | 测试用例与断言点 | 未覆盖缺口（可验证表述） | 风险影响 | 最小可执行验证步骤 |
+|---------|-------------|----------------------|-----------------|------------------------|---------|-----------------|
+| **查询参数 - limit** | `$.paths./message.get.parameters[?(@.name=="limit")]` | `api/message.go:42-45` pagingParams.Limit `binding:"min=1,max=200"` | `api/message_test.go:132-139` `Test_GetMessages_BadRequestOnInvalidLimit` → `assert.Equal(400, s.recorder.Code)` | 未验证：不传 limit 时默认值为 100；limit=1 和 limit=200 边界值 | 用户传入 limit>200 时服务行为与文档不一致 | 1. 调用 `GET /message` 不传 limit，验证返回 limit=100<br>2. 调用 `GET /message?limit=1`，验证成功<br>3. 调用 `GET /message?limit=200`，验证成功<br>4. 调用 `GET /message?limit=201`，验证返回 400 |
+| **查询参数 - since** | `$.paths./message.get.parameters[?(@.name=="since")]` | `api/message.go:42-45` pagingParams.Since `binding:"min=0"` | `api/message_test.go:109-130` `Test_GetMessages_WithLimit_WithSince_ReturnsNext` → 验证分页 since 过滤逻辑 | 未验证：since=-1（负数）、since=abc（非数字）的错误处理 | 无效 since 参数可能导致数据库查询异常 | 1. 调用 `GET /message?since=-1`，验证返回 400<br>2. 调用 `GET /message?since=abc`，验证返回 400<br>3. 调用 `GET /message?since=0`，验证成功 |
+| **路径参数 - id (user)** | `$.paths./user/{id}.get.parameters[?(@.name=="id")]` | `api/user.go:241-291` GetUserByID → `withID()` 解析 | `api/user_test.go:89-96` `Test_GetUserByID_InvalidID` → `assert.Equal(400, s.recorder.Code)`; `api/user_test.go:98-106` `Test_GetUserByID_UnknownUser` → `assert.Equal(404, s.recorder.Code)` | 未验证：id=0、id=9223372036854775807（超大值）的边界处理 | 无效 ID 可能导致 500 错误而非 400/404 | 1. 调用 `GET /user/0`，验证返回 400 或 404<br>2. 调用 `GET /user/9223372036854775807`，验证返回 404（非 500） |
+| **请求体 - ApplicationParams** | `$.paths./application.post.parameters[?(@.name=="body")].schema` | `api/application.go:34-57` ApplicationParams struct | `api/application_test.go:67-86` `Test_CreateApplication_mapAllParameters` → `assert.Equal(expected, app)` 验证所有字段映射 | 未验证：单独省略 name、description、defaultPriority、sortKey 各字段的场景 | 部分必填字段缺失时可能静默失败而非返回 400 | 1. POST `/application` 仅传 `{"name":"test"}`，验证创建成功<br>2. POST `/application` 传 `{"description":"test"}`（缺 name），验证返回 400<br>3. 对每个可选字段逐一省略测试 |
+| **请求体 - name 必填 (application)** | `$.definitions.ApplicationParams.required` | `api/application.go:44` Name 字段 `binding:"required"` | `api/client_test.go:96-108` `Test_CreateClient_expectBadRequestOnEmptyName` → `assert.Equal(400, s.recorder.Code)`（client 同类测试） | 未验证：name 仅含空白字符（如 `"   "`）的场景 | 空白 name 可能创建无效应用 | 1. POST `/application` 传 `{"name":"   "}`，验证返回 400 或自动 trim |
+| **请求体 - ClientParams** | `$.paths./client.post.parameters[?(@.name=="body")].schema` | `api/client.go:31-42` ClientParams struct | `api/client_test.go:66-79` `Test_CreateClient_mapAllParameters` → `assert.Contains(clients, expected)` | 未验证：传入未定义字段（如 description）时的行为 | 额外字段可能被忽略或导致绑定错误 | 1. POST `/client` 传 `{"name":"test","unknownField":"value"}`，验证成功且忽略未知字段 |
+| **FormData - file (upload)** | `$.paths./application/{id}/image.post.parameters[?(@.name=="file")]` | `api/application.go:327-379` UploadApplicationImage → `ctx.FormFile("file")` | **缺失判定依据：全仓 grep `Test.*Upload` 或 `Test.*Image` 无匹配结果** | 未验证：文件类型校验（仅 gif/png/jpg/jpeg）、文件大小限制、空文件上传 | 恶意文件上传或超大文件导致服务异常 | 1. 上传 1x1 gif 文件，验证成功<br>2. 上传 .exe 文件，验证返回 400<br>3. 上传空文件，验证返回 400<br>4. 上传 >15MB 文件，验证返回 400 |
+| **FormData - name (login)** | `$.paths./auth/local/login.parameters[?(@.name=="name")]` | `api/session.go:28-98` Login → `ctx.Bind(&clientParams)` | `api/session_test.go:57-93` `Test_Login_Success` → `assert.Equal("test-browser", clients[0].Name)` | 未验证：不传 name 字段时的错误处理 | 登录时缺少 name 可能导致 500 而非 400 | 1. POST `/auth/local/login` 仅传 `{"pass":"test"}`，验证返回 400 |
 
 ### 8.2 响应约束对照清单（含完整证据链）
 
@@ -787,7 +787,7 @@ func WithUser(ctx *gin.Context, userID uint) {
 
 ## 11. 附录
 
-### 8.1 相关文件清单
+### 11.1 相关文件清单
 
 | 文件路径 | 作用 |
 |---------|------|
