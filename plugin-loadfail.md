@@ -343,7 +343,7 @@ func (s *ManagerSuite) TestInitializePlugin_alreadyEnabled_cannotEnable_disabled
 | manager_test 未覆盖全部 wrap 错误类型 | manager_test 仅测试了 nothing，其余 3 种 wrap 错误未在 manager 层验证传播路径 | 中，wrap 层已测试，但 manager 的错误包装逻辑未全量验证 |
 | 缺少 plugin.Open() 失败的专用测试 | 动态链接库加载失败（如文件损坏）通过非 .so 文件间接测试 | 低，`TestNewManager_NonPluginFile_expectError` 已覆盖等价路径 |
 
-### 4.3 CI 中的测试执行
+### 4.5 CI 中的测试执行
 
 **CI 配置**（`.github/workflows/build.yml`）：
 
@@ -363,7 +363,7 @@ test-coverage:
 - 生成覆盖率报告上传到 Codecov
 - 插件测试使用构建标签 `//go:build linux || darwin`，仅在 Linux/macOS 上运行（Windows 不支持 Go plugin）
 
-### 4.4 悬挂配置处理的测试
+### 4.6 悬挂配置处理的测试
 
 **悬挂配置**（Dangling Config）指数据库中存在 PluginConf 记录，但对应的插件文件已被删除。
 
