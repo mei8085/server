@@ -251,17 +251,24 @@ const initStores = (): StoreMapping => {
 
 ### 10.2 通知权限在 granted/prompt/denied 间切换
 
-#### 权限检测的静态性
-**证据链**：`ui/src/layout/Navigation.tsx:46-47`
+#### 权限检测的双重机制
+**证据链**：`ui/src/snack/browserNotification.ts:18-27`（动态检查） + `ui/src/layout/Navigation.tsx:46-47`（静态 UI 状态）
 
 ```typescript
+// 通知能力是动态的 - 每次调用实时检查权限
+export function notifyNewMessage(msg: IMessage) {
+    const notify = new Notify(msg.title, { ... });
+    notify.show();  // notifyjs 内部实时读取 Notification.permission
+}
+
+// UI 按钮状态是静态的 - 仅组件初始化时检查一次
 const [showRequestNotification, setShowRequestNotification] =
     React.useState(mayAllowPermission);
 ```
 
-- `mayAllowPermission()` **仅在组件初始化时调用一次**
-- 未监听 `Notification.permission` 的 `change` 事件
-- 权限状态切换后，UI 不会自动响应
+- **通知能力检查是动态的**：`notifyNewMessage()` 每次调用时新建 `Notify` 实例，实时读取 `Notification.permission`
+- **UI 按钮状态是静态的**：`mayAllowPermission()` 仅在组件初始化时调用一次，决定是否显示授权按钮
+- 未监听 `Notification.permission` 的 `change` 事件，UI 不会随权限变化自动更新
 
 #### 三种切换路径的行为分析
 
@@ -423,7 +430,62 @@ Gotify 管理界面的通知系统采用「分层降级」设计：
 | 边界场景 | 浏览器原生通知行为 | Snackbar 队列行为 | 统一协调机制 |
 |---------|------------------|------------------|-------------|
 | 多标签页并发 | 每个标签页独立触发，N 页显示 N 条 | 每个标签页独立显示操作反馈 | 无。完全隔离 |
-| 权限状态切换 | 受权限影响，静默失败无提示 | 完全不受权限影响 | 无。两者独立 |
-| 重连期间 | 应用层重试会导致重复通知 | 仅连接状态变化时触发 | 无。独立事件流 |
+| 权限状态切换 | granted→denied 静默失败；denied→granted 立即恢复（无需刷新） | 完全不受权限影响，始终正常 | 无。两者独立，仅 UI 按钮状态可能滞后 |
+| 重连期间 | 应用层重试会导致重复通知 | 仅连接状态变化时触发，与消息推送独立 | 无。独立事件流 |
+
+---
+
+## 十二、评审最终判定（可直接引用）
+
+### 12.1 核心问题一句话结论
+
+**关于 denied 到 granted 权限切换**：通知能力**无需刷新页面即可立即恢复**，但侧边栏 "Enable Notifications" 按钮因仅在组件初始化时检测一次权限状态，不会随权限变化自动重新显示，导致 UI 状态与实际通知能力可能出现短暂不一致；浏览器原生通知与 Snackbar 队列之间**不存在任何统一优先级调度或互斥机制**，两者是完全独立的事件流。
+
+**具体拆解**：
+1. **denied → granted 是否需要刷新？** 不需要。`notifyNewMessage()` 在每次消息到达时都会新建 `Notify` 实例，实时读取浏览器 `Notification.permission` 状态，因此权限恢复后下一条消息即可正常弹出系统通知。
+2. **Enable Notifications 按钮状态为何不一致？** 按钮显示与否由 `Navigation.tsx:46-47` 的 `React.useState(mayAllowPermission)` 决定，该初始值仅在组件挂载时计算一次，且未监听 `Notification.permission` 的 `change` 事件。当权限在浏览器设置中被手动恢复后，React 状态不会自动更新，按钮保持隐藏状态。
+3. **两类提示通道是否存在统一优先级或互斥？** 不存在。浏览器原生通知由操作系统通知中心管理，Snackbar 由 `notistack` 内部队列管理，两者的触发条件、生命周期、展示位置完全独立，无任何共享调度逻辑或互斥规则。
+
+### 12.2 证据索引清单
+
+#### 服务端链路证据
+| 编号 | 证据内容 | 文件路径 | 关键行号 |
+|------|---------|---------|---------|
+| S1 | WebSocket 消息分发给用户所有连接，无标签页去重 | `api/stream/stream.go` | 82-91 |
+| S2 | 每条消息生成唯一自增 ID，应用层重试产生独立消息 | `api/message.go` | 363-385 |
+| S3 | WebSocket 写入失败直接丢弃，无重试队列 | `api/stream/client.go` | 95-99 |
+| S4 | WebSocket 重连无消息补发机制（握手不携带 since 参数） | `api/stream/stream.go` | 143-158 |
+
+#### 前端回调链路证据
+| 编号 | 证据内容 | 文件路径 | 关键行号 |
+|------|---------|---------|---------|
+| F1 | WebSocket 消息并行分发到三条通道（消息列表、浏览器通知、音效） | `ui/src/reactions.ts` | 22-33 |
+| F2 | 每个标签页初始化独立 Store 实例树，无跨标签页同步 | `ui/src/index.tsx` | 28-51 |
+| F3 | WebSocket 断开后 30 秒自动重连，重连时显示 Snackbar 提示 | `ui/src/message/WebSocketStore.ts` | 32-48 |
+| F4 | 消息列表直接 unshift，不检查消息 ID 是否已存在 | `ui/src/message/MessagesStore.ts` | 74-81 |
+
+#### 展示层链路证据
+| 编号 | 证据内容 | 文件路径 | 关键行号 |
+|------|---------|---------|---------|
+| U1 | `notifyNewMessage()` 每次调用新建 Notify 实例，实时检查权限 | `ui/src/snack/browserNotification.ts` | 18-27 |
+| U2 | `mayAllowPermission()` 仅作为按钮初始状态，调用一次即完成使命 | `ui/src/layout/Navigation.tsx` | 46-47 |
+| U3 | 点击授权按钮后强制设为 false，不再重新检测 | `ui/src/layout/Navigation.tsx` | 100-106 |
+| U4 | Snackbar 由 notistack 独立管理，与浏览器通知无任何关联 | `ui/src/snack/SnackManager.ts` | 7-11 |
+| U5 | SnackbarProvider 在 Layout 中全局注入，不依赖通知权限 | `ui/src/layout/Layout.tsx` | 169 |
+| U6 | 高优先级消息（priority >= 4）播放音效，1 秒防抖 | `ui/src/reactions.ts` | 26-32 |
+
+---
+
+## 十三、设计取舍评估
+
+| 设计决策 | 优势 | 潜在问题 |
+|---------|-----|---------|
+| 多标签页完全隔离 | 实现简单，状态一致性要求低 | 多标签页用户体验不佳，重复通知 |
+| 权限静态初始化检测 | 组件逻辑简洁，无额外事件监听开销 | UI 状态与实际能力可能不一致 |
+| 无前端消息去重 | 避免误删有效通知，实现简单 | 应用层重试时用户看到重复消息 |
+| 无 WebSocket 补发机制 | 服务端轻量，无状态存储开销 | 网络闪断期间消息可能丢失 |
+| 两类通知通道完全独立 | 故障隔离性好，一类失败不影响另一类 | 缺乏统一协调，可能出现重复提示 |
+
+> **评审意见**：当前设计在实现简洁性与用户体验之间做了合理权衡。若需优化，建议按优先级排序：① 权限状态动态响应（低成本，监听 permissionchange 事件）；② 前端基于消息 ID 去重（中成本，publishSingleMessage 前检查 ID）；③ 多标签页通知协调（高成本，需引入 BroadcastChannel）。
 
 这种设计在保障核心功能可靠性的同时，充分利用浏览器能力提供良好的用户体验，异常场景下有清晰的降级路径，但在多标签页协调和权限动态响应方面存在优化空间。
