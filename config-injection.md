@@ -129,30 +129,91 @@ func Register(r *gin.Engine, version model.VersionInfo, register, oidcEnabled bo
 
 ### 3.1 配置合并与封装
 
-前端在 `config.ts` 中定义配置接口，并与 `window.config` 合并：
+前端配置由两部分组成：**后端注入的静态配置**和**前端运行时计算的配置**，两者有明确的边界和执行顺序。
+
+#### 3.1.1 后端注入字段（通过 %CONFIG% 占位符）
+
+后端在 `ui/serve.go` 中序列化并注入的字段，在 HTML 模板渲染时确定：
+
+| 字段 | 来源 | 说明 |
+|------|------|------|
+| `register` | `conf.Registration` | 服务端配置项 |
+| `oidc` | `conf.OIDC.Enabled` | 服务端配置项 |
+| `version` | `vInfo` | 编译时注入的版本信息 |
+
+这些字段在 HTML 渲染时就已写入 `window.config` 对象，前端运行时不可修改。
+
+#### 3.1.2 前端运行时计算字段（url）
+
+`url` 字段**不由后端注入**，而是在前端启动阶段从 `window.location` 动态计算并注入。
+
+**window.location 计算过程**（`ui/src/index.tsx:20-26`）：
+
+```typescript
+const {port, hostname, protocol, pathname} = window.location;
+const slashes = protocol.concat('//');
+const path = pathname.endsWith('/') ? pathname : pathname.substring(0, pathname.lastIndexOf('/'));
+const url = slashes.concat(port ? hostname.concat(':', port) : hostname) + path;
+const urlWithSlash = url.endsWith('/') ? url : url.concat('/');
+const prodUrl = urlWithSlash;
+```
+
+计算规则：
+1. 从 `window.location` 提取 `protocol`、`hostname`、`port`、`pathname`
+2. 拼接协议和双斜杠：`protocol.concat('//')`
+3. 处理路径：如果 pathname 以 `/` 结尾则直接使用，否则截断到最后一个 `/` 之前
+4. 拼接主机和端口：有端口则加 `:port`，否则只用主机名
+5. 确保最终 URL 以 `/` 结尾
+
+**config.set 注入时机**（`ui/src/index.tsx:53-54`）：
+
+```typescript
+(function clientJS() {
+    config.set('url', prodUrl);  // 第一步：注入 url
+    const stores = initStores();  // 第二步：初始化 stores
+    initAxios(stores.currentUser, stores.snackManager.snack);
+    // ... 后续初始化
+})();
+```
+
+> **执行顺序关键**：`config.set('url', prodUrl)` 是前端初始化的第一个操作，在 stores 初始化、Axios 配置、用户认证之前完成，确保后续所有 API 请求都能获取到正确的 base URL。
+
+#### 3.1.3 完整的配置合并过程
 
 **关键代码**：`ui/src/config.ts:1-30`
 
 ```typescript
 export interface IConfig {
-    url: string;
-    register: boolean;
-    version: IVersion;
-    oidc: boolean;
+    url: string;        // 前端运行时计算
+    register: boolean;  // 后端注入
+    version: IVersion;  // 后端注入
+    oidc: boolean;      // 后端注入
+}
+
+declare global {
+    interface Window {
+        config?: Partial<IConfig>;  // 后端注入的字段可能不全
+    }
 }
 
 const config: IConfig = {
-    url: 'unset',
-    register: false,
-    version: {commit: 'unknown', buildDate: 'unknown', version: 'unknown'},
-    oidc: false,
-    ...window.config,  // 与服务端注入的配置合并
+    url: 'unset',       // 第1层：默认占位值
+    register: false,    // 第1层：默认值
+    version: {commit: 'unknown', buildDate: 'unknown', version: 'unknown'},  // 第1层：默认值
+    oidc: false,        // 第1层：默认值
+    ...window.config,   // 第2层：与后端注入的配置合并（HTML渲染时已确定）
 };
+
+export function set<Key extends keyof IConfig>(key: Key, value: IConfig[Key]): void {
+    config[key] = value;  // 第3层：运行时动态设置（仅用于 url）
+}
 
 export function get<K extends keyof IConfig>(key: K): IConfig[K] {
     return config[key];
 }
 ```
+
+> **边界说明**：三层配置合并顺序为「默认值 → 后端 %CONFIG% 注入 → 前端 config.set 注入」。`url` 是唯一在前端运行时计算并通过 `set()` 覆盖的字段，其余字段（register、version、oidc）均由后端在 HTML 渲染时确定，前端只读。
 
 ### 3.2 运行时配置与前端路由的真实关系
 
@@ -486,19 +547,39 @@ public oidcElevate = (durationSeconds: number): void => {
                                    │
                           ┌────────▼────────┐
                           │ window.config   │
+                          │ register, oidc, │
+                          │ version         │
                           └────────┬────────┘
                                    │
-                          ┌────────▼────────┐
-                          │ config.ts 合并  │
-                          └────────┬────────┘
-                                   │
-                   ┌───────────────┼───────────────┐
-                   │               │               │
-           ┌───────▼──────┐ ┌──────▼──────┐ ┌──────▼───────┐
-           │ 登录页面     │ │ 路由守卫     │ │ 特性开关     │
-           │ - 注册按钮   │ │ RequireAuth │ │ - OIDC按钮   │
-           │ - OIDC按钮   │ │ RequireElev │ │              │
-           └──────────────┘ └─────────────┘ └──────────────┘
+┌──────────────────────────────────┼──────────────────────────────────┐
+│  前端启动阶段                     │                                  │
+│  ┌────────▼────────┐             │                                  │
+│  │ window.location │             │                                  │
+│  │ 计算 prodUrl    │             │                                  │
+│  └────────┬────────┘             │                                  │
+│           │                      │                                  │
+│  ┌────────▼────────┐             │                                  │
+│  │ config.set('url'│             │                                  │
+│  └────────┬────────┘             │                                  │
+└───────────┼──────────────────────┼──────────────────────────────────┘
+            │                      │
+        ┌───▼──────────────────────▼───┐
+        │ config.ts 最终配置对象        │
+        │ ┌─────────────────────────┐ │
+        │ │ url: 前端计算           │ │
+        │ │ register: 后端注入      │ │
+        │ │ oidc: 后端注入          │ │
+        │ │ version: 后端注入       │ │
+        │ └─────────────────────────┘ │
+        └───────────────┬──────────────┘
+                        │
+     ┌──────────────────┼──────────────────┐
+     │                  │                  │
+┌────▼─────┐      ┌─────▼──────┐     ┌───▼───────┐
+│ 登录页面 │      │ 路由守卫    │     │ 特性开关   │
+│ - 注册   │      │ RequireAuth │     │ - OIDC提权 │
+│ - OIDC登录│     │ RequireElev │     │ 流程分支   │
+└──────────┘      └────────────┘     └───────────┘
 ```
 
 ## 七、关键文件索引
