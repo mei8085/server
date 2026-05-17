@@ -182,7 +182,7 @@ private readonly connectionError = (message: string) => {
 
 ### 3.5 重连定时器清理的已知问题
 
-**关键发现**：`tryAuthenticate()` 成功时**不会清理已挂起的重连定时器**。
+**关键发现**：`tryAuthenticate()` 成功时**不会清理已挂起的重连定时器**，`logout()` 也不会清理。
 
 ```javascript
 // tryAuthenticate 成功分支（CurrentUser.ts:83-90）
@@ -196,9 +196,22 @@ action((passThrough) => {
     // ⚠️  缺少：this.reconnectTimeoutId = null
     return passThrough;
 })
+
+// logout 实现（CurrentUser.ts:117-124）
+public logout = async () => {
+    if (this.loggedIn) {
+        runInAction(() => {
+            this.loggedIn = false;
+        });
+        await axios.post(config.get('url') + 'auth/logout').catch(() => Promise.resolve());
+        // ⚠️  缺少：window.clearTimeout(this.reconnectTimeoutId)
+        // ⚠️  缺少：this.reconnectTimeoutId = null
+    }
+};
 ```
 
-**场景复现**：
+#### 场景 A：手动 Retry 成功后定时器残留
+
 1. 网络断开 → `connectionError()` 被调用 → 设置 15 秒后自动重连的定时器
 2. 第 5 秒时网络恢复 → 用户手动点击 Retry 按钮 → `tryReconnect(false)` → `tryAuthenticate()` 成功
 3. `connectionErrorMessage = null` → Reaction 触发 `clearAll()` + `loadAll()` → 数据恢复正常
@@ -210,6 +223,60 @@ action((passThrough) => {
 - ❌ 如果此时网络再次波动，可能意外触发连接错误状态
 
 **排障提示**：如果在网络恢复后观察到"多余的认证请求"，这是预期行为，不是 Bug，但可以优化。
+
+#### 场景 B：已登出但旧重连定时器还在（边界场景）
+
+**场景复现**：
+1. 网络断开 → `connectionError()` 被调用 → 设置 15 秒后自动重连的定时器
+2. 第 5 秒时，用户手动点击登出按钮（或 4xx 错误触发自动登出）
+3. `logout()` 被调用 → `loggedIn = false` → Reaction 触发 `clearAll()`
+4. ⚠️ **关键**：`reconnectTimeoutId` 没有被清理，定时器仍然挂起
+5. **第 15 秒时**：定时器触发 → 调用 `tryReconnect(true)` → 调用 `tryAuthenticate()`
+
+**后续流程分支**：
+
+```
+tryAuthenticate() 发送 GET /current/user
+    ↓
+    ├─→ 服务器正常，返回 401 Unauthorized（因为已登出）
+    │    ↓
+    │    connectionErrorMessage = null
+    │    ↓
+    │    调用 logout()（但已经是登出状态，无额外影响）
+    │    ↓
+    │    ✅ 不会显示连接错误 Banner
+    │    ✅ 不会影响登录页
+    │
+    ├─→ 网络错误（无 response）或 5xx 服务器错误
+    │    ↓
+    │    调用 connectionError("错误信息")
+    │    ↓
+    │    connectionErrorMessage = "错误信息" → 非空
+    │    ↓
+    │    ❗ 登录页顶部显示红色连接错误 Banner
+    │    ↓
+    │    设置新的重连定时器，继续指数退避重试
+    │
+    └─→ 其他 4xx 错误
+         ↓
+         connectionErrorMessage = null
+         ↓
+         调用 logout()
+         ↓
+         ✅ 无不良影响
+```
+
+**对登录页的影响**：
+- ✅ 如果服务器正常（返回 401）：登录页不受影响，用户正常登录
+- ❌ 如果网络断开或服务器 5xx：登录页顶部显示连接错误 Banner，可能误导用户以为登录服务不可用
+- ❌ 自动重连会持续在后台进行，产生多余的 API 请求
+
+**排障判断点**：
+1. 观察 Network 面板：登出后是否仍有 `/current/user` 请求发出
+2. 检查 `connectionErrorMessage` 的值：登出状态下是否意外变为非空
+3. 确认登出前是否有连接错误状态（连接错误 Banner 曾显示过）
+
+**临时解决方案**：登出后刷新页面（F5），清除所有定时器和状态
 
 ### 3.6 完整错误状态生命周期
 
