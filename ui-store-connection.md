@@ -8,6 +8,8 @@ Gotify 前端采用 MobX 进行状态管理，通过多个 Store 协同工作来
 - 普通 API 500 错误 ≠ 触发连接错误 Banner
 - 只有 `tryAuthenticate()` 认证请求的 500/网络错误才会触发连接错误状态
 - Retry 成功 ≠ 立即清理数据，需 `connectionErrorMessage` 从非 null → null 才触发
+- ⚠️ 已知问题 1：手动 Retry 成功后，已挂起的自动重连定时器不会被清理
+- ⚠️ 已知问题 2：连接恢复时，`pendingDeletes`（待删除消息）不会被清理，可能导致消息"消失"
 
 ## 2. Store 架构与错误处理分流
 
@@ -178,6 +180,86 @@ private readonly connectionError = (message: string) => {
 };
 ```
 
+### 3.5 重连定时器清理的已知问题
+
+**关键发现**：`tryAuthenticate()` 成功时**不会清理已挂起的重连定时器**。
+
+```javascript
+// tryAuthenticate 成功分支（CurrentUser.ts:83-90）
+action((passThrough) => {
+    this.user = passThrough.data;
+    this.loggedIn = true;
+    this.authenticating = false;
+    this.connectionErrorMessage = null;
+    this.reconnectTime = 7500;
+    // ⚠️  缺少：window.clearTimeout(this.reconnectTimeoutId)
+    // ⚠️  缺少：this.reconnectTimeoutId = null
+    return passThrough;
+})
+```
+
+**场景复现**：
+1. 网络断开 → `connectionError()` 被调用 → 设置 15 秒后自动重连的定时器
+2. 第 5 秒时网络恢复 → 用户手动点击 Retry 按钮 → `tryReconnect(false)` → `tryAuthenticate()` 成功
+3. `connectionErrorMessage = null` → Reaction 触发 `clearAll()` + `loadAll()` → 数据恢复正常
+4. **第 15 秒时**：之前挂起的定时器触发 → 再次调用 `tryReconnect(true)` → 再次发送 `/current/user` 请求
+
+**影响**：
+- ✅ 不会导致数据重复清理：因为 `connectionErrorMessage` 已经是 null，再次设置为 null 不会触发 MobX reaction
+- ❌ 会产生一次多余的 API 请求（`GET /current/user`）
+- ❌ 如果此时网络再次波动，可能意外触发连接错误状态
+
+**排障提示**：如果在网络恢复后观察到"多余的认证请求"，这是预期行为，不是 Bug，但可以优化。
+
+### 3.6 完整错误状态生命周期
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      初始状态                                     │
+│  connectionErrorMessage = null                                   │
+│  reconnectTimeoutId = null                                       │
+│  reconnectTime = 7500ms                                          │
+└────────────────────────────┬────────────────────────────────────┘
+                             ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                tryAuthenticate() 失败（网络/5xx）                  │
+└────────────────────────────┬────────────────────────────────────┘
+                             ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                   connectionError() 被调用                        │
+│  ├─ connectionErrorMessage = "错误信息"                           │
+│  ├─ 清除已有 reconnectTimeoutId（如果有）                          │
+│  ├─ 设置新的 reconnectTimeoutId（T 秒后触发）                      │
+│  └─ reconnectTime = min(reconnectTime * 2, 120000)               │
+└────────────────────────────┬────────────────────────────────────┘
+                             ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                      等待重连                                      │
+│  连接错误 Banner 显示                                              │
+│  倒计时中... 用户可以点击 Retry 手动触发                            │
+└────────────────────────────┬────────────────────────────────────┘
+                             ↓
+              ┌──────────────┴──────────────┐
+              ↓                             ↓
+┌───────────────────────────┐   ┌───────────────────────────┐
+│   定时器到点自动触发       │   │   用户点击 Retry 手动触发   │
+│   tryReconnect(true)      │   │   tryReconnect(false)     │
+└─────────────┬─────────────┘   └─────────────┬─────────────┘
+              ↓                             ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                     tryAuthenticate()                            │
+│  ├─ 成功 → connectionErrorMessage = null                         │
+│  │    ├─ 如果之前是错误状态 → Reaction 触发清理+加载              │
+│  │    └─ ⚠️  reconnectTimeoutId 未清理（可能后续再触发一次）       │
+│  │
+│  ├─ 网络/5xx 失败 → connectionError()                            │
+│  │    └─ 重置定时器，继续退避重试                                 │
+│  │
+│  └─ 4xx 失败 → connectionErrorMessage = null + logout()          │
+│       └─ 如果之前是错误状态 → Reaction 触发清理                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
 ## 4. 提示条出现条件
 
 ### 4.1 ConnectionErrorBanner（顶部红色错误条）
@@ -304,10 +386,11 @@ reaction(
 
 ```javascript
 const clearAll = () => {
-    // 1. MessagesStore：清空所有消息状态
+    // 1. MessagesStore：清空消息状态
     stores.messagesStore.clearAll();
     //    - this.state = {} （所有应用的消息缓存）
     //    - 重新创建空的应用状态
+    //    - ⚠️  注意：pendingDeletes 未被清理
 
     // 2. AppStore：清空应用列表
     stores.appStore.clear();
@@ -329,16 +412,56 @@ const clearAll = () => {
 
 #### ❌ 不会被清理的状态
 
-| Store | 未清理内容 | 原因 |
-|-------|-----------|------|
+| Store | 未清理内容 | 原因 / 影响 |
+|-------|-----------|------------|
 | **CurrentUser** | `user` 对象、`loggedIn`、`authenticating` | 认证成功时已更新，无需额外清理 |
 | **ElevateStore** | `elevated`、`oidcElevatePending` | 权限状态独立，与连接恢复无关 |
 | **SnackManager** | 已显示的 Snackbar | Snackbar 自行管理生命周期 |
-| **pluginStore** | `items`（插件列表） | ❗ Bug？clearAll 中未调用，但继承 BaseStore.clear() |
+| **PluginStore** | `items`（插件列表） | ❗ 潜在遗漏：clearAll 中未调用，但 refreshKey++ 后页面会重新加载 |
+| **MessagesStore** | `pendingDeletes`（待删除消息） | ❗ 重要 Bug：会导致消息"消失"，详见 5.4 |
 
-**注意**：PluginStore 的 `clear()` 方法继承自 BaseStore，但 `clearAll()` 中没有调用 `stores.pluginStore.clear()`，这可能是一个遗漏。
+### 5.4 MessagesStore pendingDeletes 清理问题详解
 
-### 5.4 重新加载操作 (`loadAll()` - `reactions.ts:22-35`)
+**关键发现**：`MessagesStore.clearAll()` 只清空了 `this.state`，但**没有清理 `pendingDeletes`**。
+
+```javascript
+// MessagesStore.clearAll() 实现（MessagesStore.ts:157-160）
+@action
+public clearAll = () => {
+    this.state = {};  // ✅ 清理消息缓存
+    this.createEmptyStatesForApps(this.appStore.getItems());
+    // ⚠️  缺少：this.pendingDeletes.clear();
+};
+```
+
+**pendingDeletes 的作用**：
+- 存储用户点击删除但还在 Undo 倒计时内的消息
+- `visible(messageId)` 方法：`return !this.pendingDeletes.has(messageId)`
+- 消息列表渲染时会过滤掉 `pendingDeletes` 中的消息：
+  ```javascript
+  // MessagesStore.ts:204
+  .messages.filter((message) => !this.pendingDeletes.has(message.id))
+  ```
+
+**场景复现**：
+1. 用户删除一条消息 → 消息进入 `pendingDeletes` → 列表中隐藏（等待 Undo 或 5 秒后自动删除）
+2. 在 Undo 倒计时内（< 5 秒），网络断开 → 连接错误 Banner 出现
+3. 网络恢复 → 连接恢复 → `clearAll()` 被调用 → `this.state = {}`，但 `pendingDeletes` 保留
+4. `refreshKey++` → 页面重新挂载 → 重新调用 `loadMore()` 从服务器加载消息
+5. **问题**：服务器返回的消息列表中包含刚才"删除"的消息（因为服务器还没收到删除请求），但由于 `pendingDeletes` 中还有这条消息的 ID，`get()` 方法会过滤掉它
+6. **用户可见影响**：这条消息在列表中"消失"了，用户以为被删除了，但实际上服务器上还存在
+
+**其他连锁影响**：
+- 如果 Snackbar Undo 按钮还在显示，用户点击 Undo → `cancelPendingDelete()` 会从 `pendingDeletes` 中移除 → 消息重新出现（表现为"消失又回来"）
+- 如果 5 秒倒计时结束，`removeSingle()` 会发送删除请求到服务器 → 消息真正被删除 → 下次刷新时消失
+- 如果页面被刷新（F5），`pendingDeletes` 丢失 → 消息重新出现（因为服务器上还存在）
+
+**排障提示**：
+- 如果用户反馈"消息消失了，但刷新页面又出现"，检查是否在删除消息后立即发生了连接恢复
+- 查看 Network 面板：连接恢复后重新加载的消息列表中是否包含该消息 ID
+- 确认 `pendingDeletes` Map 的内容（可通过 MobX DevTools 查看）
+
+### 5.5 重新加载操作 (`loadAll()` - `reactions.ts:22-35`)
 
 ```javascript
 const loadAll = () => {
@@ -356,7 +479,7 @@ const loadAll = () => {
 };
 ```
 
-### 5.5 组件强制刷新机制
+### 5.6 组件强制刷新机制
 
 通过 `refreshKey` 变化触发整个应用的重新挂载：
 
@@ -408,12 +531,26 @@ reaction(
 - ✅ 初始 null → 成功 null 不会触发 reaction
 - ✅ 检查 reaction 是否正常注册（`registerReactions()` 被调用）
 
-### 7.3 数据清理不完整？
-- ✅ 检查 clearAll() 调用了哪些 Store 的 clear()
-- ✅ PluginStore 可能遗漏清理
-- ✅ ElevateStore 状态不会被清理
+### 7.3 网络恢复后出现多余的认证请求？
+- ✅ 这是**预期行为**：`tryAuthenticate()` 成功时未清理重连定时器
+- ✅ 之前挂起的定时器会在原定时间再次触发 `tryReconnect(true)`
+- ✅ 不会导致数据重复清理，但会产生一次多余的 API 请求
+- ✅ 可优化点：在 `tryAuthenticate()` 成功分支中添加 `clearTimeout` 逻辑
 
-### 7.4 重连间隔异常？
+### 7.4 删除消息后立即断网恢复，消息"消失"？
+- ✅ 这是**Bug**：`MessagesStore.clearAll()` 未清理 `pendingDeletes`
+- ✅ 复现路径：删除消息 → 5秒 Undo 窗口内网断网恢复 → 消息被过滤
+- ✅ 验证方法：F5 刷新页面，消息会重新出现（服务器上还存在）
+- ✅ 临时解决：让用户等待 5 秒后自动执行删除，或点击 Undo 再重新删除
+- ✅ 修复方案：在 `clearAll()` 中添加 `this.pendingDeletes.clear()`
+
+### 7.5 数据清理不完整？
+- ✅ 检查 clearAll() 调用了哪些 Store 的 clear()
+- ✅ PluginStore 可能遗漏清理（refreshKey++ 后页面会重新加载）
+- ✅ ElevateStore 状态不会被清理
+- ✅ MessagesStore.pendingDeletes 不会被清理（见 7.4）
+
+### 7.6 重连间隔异常？
 - ✅ 初始间隔 7500ms，每次失败翻倍
 - ✅ 最大间隔 120000ms（2分钟）
 - ✅ 成功后重置为 7500ms
