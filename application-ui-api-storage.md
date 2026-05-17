@@ -379,14 +379,18 @@ type Application struct {
 
 ### 6.2 数据库约束汇总
 
-| 约束类型 | 约束名称 | 字段组合 | 作用 |
-|---------|---------|---------|------|
-| **主键约束** | PRIMARY | `id` | 每行唯一标识，自增 |
-| **唯一索引** | `uix_applications_token` | `token` | 全局Token唯一，防止Token冲突 |
-| **联合唯一索引** | `uix_application_user_id_sort_key` | `user_id` + `sort_key` | 同一用户下SortKey唯一，分数索引排序 |
-| **外键约束** | - | `user_id` → `users.id` | 应用必须属于存在的用户，级联删除 |
-| **长度约束** | - | `token`: varchar(180) | Token长度限制 |
-| **长度约束** | - | `sort_key`: bytes(255) | SortKey长度限制 |
+| 约束类型 | 约束名称 | 字段组合 | 作用 | 代码证据 |
+|---------|---------|---------|------|---------|
+| **主键约束** | PRIMARY | `id` | 每行唯一标识，自增 | `model/application.go:16` `gorm:"primaryKey;autoIncrement"` |
+| **唯一索引** | `uix_applications_token` | `token` | 全局Token唯一，防止Token冲突 | `model/application.go:22` `uniqueIndex:uix_applications_token` |
+| **联合唯一索引** | `uix_application_user_id_sort_key` | `user_id` + `sort_key` | 同一用户下SortKey唯一，分数索引排序 | `model/application.go:23,61` `uniqueIndex:uix_application_user_id_sort_key` |
+| **长度约束** | - | `token`: varchar(180) | Token长度限制 | `model/application.go:22` `type:varchar(180)` |
+| **长度约束** | - | `sort_key`: bytes(255) | SortKey长度限制 | `model/application.go:61` `type:bytes;...length:255` |
+
+> **关于外键约束的说明**：未在代码中找到 `user_id` 数据库级外键约束的定义。
+> - `database/database.go:38` 配置 `DisableForeignKeyConstraintWhenMigrating: true`，表明GORM迁移时禁用了外键约束。
+> - 删除用户时的"级联删除"在业务逻辑层实现：`database/user.go:55-69` 手动循环删除该用户的所有应用、客户端和插件配置。
+> - 不存在数据库级的 `ON DELETE CASCADE` 约束。
 
 ### 6.3 SortKey 生成机制（创建操作特有）
 
@@ -462,7 +466,6 @@ POST /application
 └───────────────────────────────────────────────────────┘
     ↓
 ┌─ 执行INSERT ──────────────────────────────────────────┐
-│  • UserID外键约束失败 → 500（理论上不会发生）        │
 │  • Token唯一索引冲突 → 500（理论上不会发生）          │
 │  • SortKey+UserID唯一索引冲突 → 事务回滚 → 400        │
 │    "sort key is not unique"                           │
