@@ -322,17 +322,24 @@ func (a *SessionAPI) Login(ctx *gin.Context) {
 | 失败条件 | HTTP 状态码 | 返回方式 | 是否写 Cookie | 其他影响 | 代码依据 |
 |---------|-----------|---------|-------------|---------|---------|
 | 请求参数绑定失败 | 400 | `ctx.AbortWithError`，JSON 错误 | 否 | 无 | oidc.go:347-350 |
-| State 无效或已过期 | 400 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` 已消费（Pop 操作） | oidc.go:351-355 |
+| State 无效（Map 中不存在） | 400 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` **未消费**（Pop 返回 false） | oidc.go:351-355, 435-441 |
+| State 有效但已过期（存在但超时） | 400 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` **已消费**（Pop 已从 Map 删除，后因超时而返回失败） | oidc.go:351-355, 435-441 |
 | 令牌交换失败（PKCE 验证失败等） | 401 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` 已消费 | oidc.go:360-364 |
 | 用户信息获取失败 | 500 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` 已消费 | oidc.go:365-369 |
-| 用户解析失败（同浏览器） | 403/500 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` 已消费，用户可能已创建 | oidc.go:370-374 |
-| Client 创建失败 | 500 | `ctx.AbortWithError`，JSON 错误 | 否 | 用户已创建，`pendingSession` 已消费 | oidc.go:375-379 |
+| 用户名 claim 缺失 | 500 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` 已消费 | oidc.go:370-374 |
+| 用户不存在且自动注册关闭 | 403 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` 已消费 | oidc.go:370-374 |
+| 用户创建数据库错误 | 500 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` 已消费 | oidc.go:370-374 |
+| Client 创建数据库错误 | 500 | `ctx.AbortWithError`，JSON 错误 | 否 | `pendingSession` 已消费，用户已创建 | oidc.go:375-379 |
 
 **OIDC 原生应用失败特点：**
 - 所有失败均返回 JSON 格式错误
 - 从不设置 Cookie（该 API 本身就不写 Cookie）
-- `popPendingSession` 在最开始执行，除了参数绑定失败外，所有后续失败都会导致 `pendingSession` 已消费
-- 用户解析失败时，用户**可能已创建**（如果是新用户且自动注册开启）
+- **popPendingSession 行为拆分**（oidc.go:435-441）：
+  - 先执行 `Pop` 从 Map 中删除
+  - 再检查 `time.Since(session.CreatedAt) < pendingSessionMaxAge` 时间窗
+  - 因此：无效 state（不存在）→ 不消费；过期 state（存在但超时）→ 已消费
+- `popPendingSession` 在最开始执行，除了参数绑定失败和完全无效 state 外，后续失败都会导致 `pendingSession` 已消费
+- 用户解析失败时，用户**可能已创建**（如果是新用户且自动注册开启且数据库创建成功）
 
 ### 6.5 会话提升分支对比
 
