@@ -263,6 +263,70 @@ check-ci: check-swagger check-js
 
 这确保每次代码提交都必须保持 API 文档与实现的一致性。
 
+### 4.4 路由注册、注释声明与 Spec 生成的逐层校验关系
+
+API 文档生成涉及三层独立的定义，每层之间可能产生漂移，当前校验机制如下：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Layer 1: 路由注册 (router/router.go)                        │
+│  - gin 路由定义: g.GET("/message", handler)                 │
+│  - 中间件绑定: Use(authentication.RequireClient)           │
+│  - HTTP 方法与路径的最终来源                               │
+├─────────────────────────────────────────────────────────────┤
+│ Layer 2: 注释声明 (api/*.go)                                │
+│  - swagger:operation 注释定义路径、方法、参数、响应        │
+│  - swagger:model 注释定义数据模型                           │
+│  - 这是 spec.json 的直接输入源                              │
+├─────────────────────────────────────────────────────────────┤
+│ Layer 3: Spec 生成 (docs/spec.json)                         │
+│  - go-swagger 工具从注释生成                                │
+│  - 对外发布的 API 规范                                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**逐层校验关系：**
+
+| 校验方向 | 当前机制 | 校验粒度 |
+|---------|---------|---------|
+| Layer 2 → Layer 3 | `check-swagger` 通过 git diff 检测 | 完整 spec 重生成对比 |
+| Layer 1 → Layer 2 | **无自动校验**，依赖人工确保 | 无 |
+| Layer 1 → Layer 3 | **无自动校验**，依赖集成测试间接覆盖 | 部分覆盖 |
+
+**关键脱节风险：**
+- **路由路径不一致**：`router.go` 中注册的路径与 `swagger:operation` 注释中的路径可能不同
+- **HTTP 方法不一致**：实际绑定的方法与注释声明的方法可能不同
+- **中间件不一致**：实际使用的认证中间件与注释中的 `security` 声明可能不同
+- **参数绑定不一致**：代码中实际绑定的参数与注释声明的参数可能不同
+
+### 4.5 漂移类型分类：可自动发现 vs 无法发现
+
+#### 4.5.1 可自动发现的漂移类型
+
+| 漂移类型 | 发现机制 | 触发条件 |
+|---------|---------|---------|
+| 新增/删除 API 注释 | `check-swagger` git diff | 增删 `swagger:operation` 注释 |
+| 修改注释中的路径 | `check-swagger` git diff | 修改 `swagger:operation <METHOD> <PATH>` 中的 PATH |
+| 修改注释中的 HTTP 方法 | `check-swagger` git diff | 修改 `swagger:operation <METHOD> <PATH>` 中的 METHOD |
+| 修改参数定义 | `check-swagger` git diff | 修改 `parameters` 块 |
+| 修改响应结构 | `check-swagger` git diff | 修改 `responses` 块或模型字段 |
+| 修改注释中的认证声明 | `check-swagger` git diff | 修改 `security` 块 |
+| 修改数据模型字段 | `check-swagger` git diff | 修改 `swagger:model` 结构体字段或 tag |
+| 修改全局元数据 | `check-swagger` git diff | 修改 `swagger:meta` 注释 |
+
+#### 4.5.2 当前无法自动发现的漂移类型
+
+| 漂移类型 | 风险说明 | 为何无法发现 |
+|---------|---------|-------------|
+| **路由注册路径 vs 注释路径不一致** | 注释写 `/message`，实际注册 `/messages` | go-swagger 只扫描注释，不扫描 gin 路由注册代码 |
+| **HTTP 方法不匹配** | 注释写 `GET`，实际注册 `POST` | 同上，注释与路由注册是独立的 |
+| **认证中间件 vs security 声明不一致** | 注释声明需要 client token，实际路由未加认证中间件 | 中间件绑定在 router.go，security 声明在注释中，无交叉校验 |
+| **实际响应状态码缺失** | 代码实际返回 409 Conflict，但注释未声明 | check-swagger 只检查注释是否变化，不检查实现是否匹配注释 |
+| **参数验证规则不一致** | 注释声明 `minimum: 1`，代码中 `binding:"min=0"` | 注释约束与 Go struct tag 独立，无交叉校验 |
+| **请求体模型不匹配** | 注释引用 `ApplicationParams`，代码实际绑定 `Application` | 需要静态分析或运行时测试发现 |
+| **响应模型不匹配** | 注释声明返回 `User`，代码实际返回 `UserExternal` | 同上 |
+| **路由实际不存在** | 注释声明了 API，但 router.go 中未注册 | 注释存在但无实际路由，go-swagger 仍会生成 spec |
+
 ## 5. 测试夹具反向校验 Spec 与实现一致性
 
 ### 5.1 测试架构概述
