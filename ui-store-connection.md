@@ -528,6 +528,83 @@ public clearAll = () => {
 - 查看 Network 面板：连接恢复后重新加载的消息列表中是否包含该消息 ID
 - 确认 `pendingDeletes` Map 的内容（可通过 MobX DevTools 查看）
 
+#### 场景 B：登出再登录跨会话残留（边界场景）
+
+**代码验证结论**：
+- ✅ `pendingDeletes` 是 MessagesStore 的类成员，在应用生命周期内只初始化一次（构造函数中）
+- ✅ 登出时调用 `clearAll()` → 调用 `messagesStore.clearAll()` → 只清空 `this.state`，**不清理 `pendingDeletes`**
+- ✅ 登录时调用 `loadAll()` → **没有任何清理 `pendingDeletes` 的逻辑**
+- ✅ `get()` 方法中明确过滤：`.filter((message) => !this.pendingDeletes.has(message.id))`
+- ⚠️ **结论**：`pendingDeletes` 会跨会话保留，并继续参与新会话的消息列表过滤
+
+**跨会话可复现实验**：
+
+| 项目 | 内容 |
+|------|------|
+| **前置条件** | 1. 服务器有 2 个测试用户（用户 A、用户 B）<br>2. 用户 A 有一条消息 ID=123<br>3. 用户 B 有一条消息 ID=123（或服务器重启后 ID 重置，新消息 ID 从 1 开始）<br>4. 浏览器已安装 MobX DevTools（可选） |
+| **操作顺序** | 1. 以用户 A 登录，进入消息列表<br>2. 找到 ID=123 的消息，点击删除<br>3. **在 5 秒 Undo 倒计时内**，点击用户头像 → 登出<br>4. 立即以用户 B 登录（或同一用户 A 重新登录）<br>5. 进入消息列表，查看消息 |
+| **预期行为** | 用户 B 的消息列表应显示所有消息，包括 ID=123 的消息（与用户 A 的删除操作无关） |
+| **实际行为** | 用户 B 的消息列表中 ID=123 的消息被过滤，无法看到<br>刷新页面（F5）后，ID=123 的消息重新出现 |
+| **验证方法** | 1. 打开 Network 面板：确认 `/message` 接口返回数据中包含 ID=123<br>2. 打开 MobX DevTools：确认 `pendingDeletes` Map 中仍有 ID=123 的条目<br>3. 在 Console 执行：`stores.messagesStore.pendingDeletes.has(123)` → 返回 `true` |
+
+**用户可见影响**：
+- ❌ 新会话中 ID=123 的消息"消失"，用户看不到这条消息
+- ❌ 如果是不同用户登录，前一用户的待删除状态会影响当前用户的消息可见性（会话隔离被破坏）
+- ❌ 刷新页面（F5）后 `pendingDeletes` 丢失，消息重新出现
+- ✅ 如果 Undo 倒计时结束，`removeSingle()` 会尝试发送删除请求（但可能因会话已切换而 401 失败）
+
+**风险概率说明**：
+- 消息 ID 是数据库自增 ID，正常情况下不同会话中 ID 不会立即重复
+- 但如果服务器重启、数据库重置或 ID 回绕，ID 可能重复
+- 更常见的场景：同一用户快速登出再登录，前一删除操作的 ID 恰好是新会话中某条消息的 ID
+
+**排障判断点**：
+1. 观察 MobX DevTools 中 `pendingDeletes` 的内容：登出后是否非空
+2. 复现步骤：删除消息 → 5 秒内登出 → 立即登录 → 检查对应 ID 的消息是否可见
+3. 查看 Console：是否有 `removeSingle()` 失败的错误（跨会话删除请求）
+4. 对比刷新页面前后的消息列表差异
+5. 在 Console 执行 `stores.messagesStore.pendingDeletes.size` 确认残留数量
+
+**临时解决方案**：登出后刷新页面（F5），清除所有内存状态
+
+#### 场景 C：与登出后残留重连定时器的组合影响
+
+当 `pendingDeletes` 跨会话残留**和**登出后重连定时器残留**同时存在时，会出现以下复合现象：
+
+```
+用户 A 操作：
+  1. 删除消息（ID=123）→ pendingDeletes 新增 ID=123
+  2. 断开网络 → tryAuthenticate 失败 → connectionError()
+     → 设置 15 秒后重连的定时器
+  3. 在 5 秒内登出 → loggedIn = false
+     → clearAll() → this.state = {}，但 pendingDeletes 保留
+     → ⚠️ reconnectTimeoutId 未清理，定时器仍挂起
+
+用户 B 登录（第 10 秒时）：
+  4. 登录成功 → loggedIn = true → loadAll()
+     → 加载消息列表，但 pendingDeletes 仍有 ID=123
+     → ID=123 的消息被过滤，用户 B 看不到
+
+第 15 秒时（组合效应触发）：
+  5. 旧定时器触发 → tryReconnect(true) → tryAuthenticate()
+     → 发送 GET /current/user（携带用户 B 的凭证）
+     → 认证成功（用户 B 已登录）
+     → connectionErrorMessage = null（已是 null，无变化）
+     → ⚠️ 由于 connectionErrorMessage 没有"从非 null 变为 null"，
+        Reaction 不会触发 clearAll/loadAll
+     → pendingDeletes 继续保留，ID=123 的消息继续被隐藏
+
+用户可见的复合现象：
+  - 用户 B 的消息列表中 ID=123 的消息消失
+  - 第 15 秒左右 Network 面板出现一次多余的 /current/user 请求
+  - 刷新页面后，ID=123 的消息重新出现，多余请求停止
+```
+
+**排障判断点（复合场景）**：
+1. 消息列表中某些消息意外消失 + Network 面板有多余的认证请求
+2. 登出前同时存在：未完成的删除操作 + 连接错误状态
+3. 刷新页面后两个问题同时消失
+
 ### 5.5 重新加载操作 (`loadAll()` - `reactions.ts:22-35`)
 
 ```javascript
@@ -604,20 +681,35 @@ reaction(
 - ✅ 不会导致数据重复清理，但会产生一次多余的 API 请求
 - ✅ 可优化点：在 `tryAuthenticate()` 成功分支中添加 `clearTimeout` 逻辑
 
-### 7.4 删除消息后立即断网恢复，消息"消失"？
+### 7.4 登出后登录页仍显示连接错误 Banner？
+- ✅ 检查登出前是否有连接错误状态（连接错误 Banner 曾显示
+- ✅ 观察 Network 面板：登出后是否仍有 `/current/user` 请求发出
+- ✅ 验证：登出后网络断开/服务器 5xx → 旧定时器触发 → `connectionErrorMessage` 被设置为非空
+- ✅ 临时解决：登出后刷新页面（F5）
+- ✅ 修复方案：在 `logout()` 中添加 `clearTimeout(this.reconnectTimeoutId)`
+
+### 7.5 删除消息后立即断网恢复，消息"消失"？
 - ✅ 这是**Bug**：`MessagesStore.clearAll()` 未清理 `pendingDeletes`
 - ✅ 复现路径：删除消息 → 5秒 Undo 窗口内网断网恢复 → 消息被过滤
 - ✅ 验证方法：F5 刷新页面，消息会重新出现（服务器上还存在）
 - ✅ 临时解决：让用户等待 5 秒后自动执行删除，或点击 Undo 再重新删除
 - ✅ 修复方案：在 `clearAll()` 中添加 `this.pendingDeletes.clear()`
 
-### 7.5 数据清理不完整？
+### 7.6 新登录用户看不到某些消息？
+- ✅ 检查前一用户登出前是否有未完成的删除操作（5 秒 Undo 窗口内）
+- ✅ 复现路径：用户 A 删除消息 → 5 秒内登出 → 用户 B 立即登录 → 相同 ID 消息被过滤
+- ✅ 验证方法：F5 刷新页面，消息重新出现
+- ✅ 临时解决：登出后刷新页面
+- ✅ 修复方案：在 `clearAll()` 中添加 `this.pendingDeletes.clear()`
+
+### 7.7 数据清理不完整？
 - ✅ 检查 clearAll() 调用了哪些 Store 的 clear()
 - ✅ PluginStore 可能遗漏清理（refreshKey++ 后页面会重新加载）
 - ✅ ElevateStore 状态不会被清理
-- ✅ MessagesStore.pendingDeletes 不会被清理（见 7.4）
+- ✅ MessagesStore.pendingDeletes 不会被清理（见 7.5、7.6）
+- ✅ CurrentUser.reconnectTimeoutId 不会被清理（见 7.3、7.4）
 
-### 7.6 重连间隔异常？
+### 7.8 重连间隔异常？
 - ✅ 初始间隔 7500ms，每次失败翻倍
 - ✅ 最大间隔 120000ms（2分钟）
 - ✅ 成功后重置为 7500ms
