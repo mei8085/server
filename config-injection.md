@@ -346,6 +346,124 @@ func (m *Manager) loadPlugins(directory string) error {
 
 **后端 API 路由始终注册**：无论 `PluginsDir` 是否为空，`/plugin` 相关 API 路由都会在 `router/router.go:133-143` 中注册。当插件系统为空时，API 仅返回空列表。
 
+#### 4.1.2 异常路径的完整证据链与服务启动稳定性影响
+
+`PluginsDir` 配置异常会在 router 初始化阶段触发 panic 并导致服务启动中断。以下是完整的证据链：
+
+**证据链起点：router.Create 调用 plugin.NewManager**
+
+**关键代码**：`router/router.go:93-96`
+
+```go
+pluginManager, err := plugin.NewManager(db, conf.PluginsDir, g.Group("/plugin/:id/custom/"), streamHandler)
+if err != nil {
+    panic(err)
+}
+```
+
+> 关键事实：`plugin.NewManager` 返回的任何错误都会被 `panic(err)` 直接抛出，导致服务启动中断。
+
+**证据链传播：NewManager 内部调用 loadPlugins**
+
+**关键代码**：`plugin/manager.go:57-88`
+
+```go
+func NewManager(db Database, directory string, mux *gin.RouterGroup, notifier Notifier) (*Manager, error) {
+    manager := &Manager{
+        mutex:     &sync.RWMutex{},
+        instances: map[uint]compat.PluginInstance{},
+        plugins:   map[string]compat.Plugin{},
+        messages:  make(chan MessageWithUserID),
+        db:        db,
+        mux:       mux,
+    }
+    // ... 启动消息处理 goroutine
+
+    if err := manager.loadPlugins(directory); err != nil {
+        return nil, err  // 错误向上传播
+    }
+    // ...
+}
+```
+
+**证据链核心：loadPlugins 中可能触发错误的各个分支**
+
+**关键代码**：`plugin/manager.go:219-266`
+
+```go
+func (m *Manager) loadPlugins(directory string) error {
+    if directory == "" {
+        return nil  // 空路径：正常返回，无错误
+    }
+
+    pluginFiles, err := os.ReadDir(directory)
+    if err != nil {
+        return fmt.Errorf("error while reading directory %s", err)  // 分支1：目录无法读取
+    }
+
+    for _, file := range pluginFiles {
+        if file.IsDir() || !strings.HasSuffix(file.Name(), ".so") {
+            continue
+        }
+
+        pluginPath := filepath.Join(directory, file.Name())
+        p, err := plugin.Open(pluginPath)
+        if err != nil {
+            return fmt.Errorf("error while opening plugin %s: %s", pluginPath, err)  // 分支2：.so文件无法打开
+        }
+
+        sym, err := p.Lookup("GetGotifyPluginInstance")
+        if err != nil {
+            return fmt.Errorf("error while looking up GetGotifyPluginInstance in %s: %s", pluginPath, err)  // 分支3：符号不存在
+        }
+
+        gotifyPlugin, ok := sym.(func() compat.Plugin)
+        if !ok {
+            return fmt.Errorf("plugin %s does not implement GetGotifyPluginInstance correctly", pluginPath)  // 分支4：类型不匹配
+        }
+
+        m.plugins[pluginPath] = gotifyPlugin()
+    }
+    return nil
+}
+```
+
+**完整 panic 传播链**：
+
+```
+app.go main()
+    ↓
+router.Create(db, vInfo, conf)  ← router 初始化阶段
+    ↓
+plugin.NewManager(db, conf.PluginsDir, ...)
+    ↓
+manager.loadPlugins(conf.PluginsDir)
+    ↓
+触发错误分支（目录不可读/.so损坏/符号不存在等）
+    ↓
+loadPlugins 返回 error
+    ↓
+NewManager 返回 (nil, err)
+    ↓
+router/router.go:95 执行 panic(err)
+    ↓
+服务启动中断，进程退出（无回退/降级机制）
+```
+
+**测试验证**：`router/router_test.go:358-367`
+
+```go
+func (s *IntegrationSuite) TestPluginLoadFail_expectPanic() {
+    assert.Panics(s.T(), func() {
+        Create(db.GormDatabase, new(model.VersionInfo), &config.Configuration{
+            PluginsDir: "<THIS_PATH_IS_MALFORMED>",
+        })
+    })
+}
+```
+
+> **结论**：`PluginsDir` 是唯一可能导致服务启动失败的前端可见配置项。任何异常（路径无效、权限不足、插件损坏）都会在 router 初始化阶段触发 panic，服务直接退出，不会降级运行。
+
 ### 4.2 前端插件管理界面的可见性分析
 
 #### 4.2.1 界面可见性：不受配置项直接控制
@@ -466,30 +584,52 @@ const Clients = observer(() => {
 
 #### 5.2.3 OIDC 开关对提权流程分支的真实影响
 
-当用户执行需要二次认证的操作时（如删除客户端、提升客户端权限），`ElevationForm 会根据 `oidc` 配置呈现不同的提权选项：
+当用户执行需要二次认证的操作时（如删除客户端、提升客户端权限），`ElevationForm` 会根据 `oidc` 配置呈现不同的提权选项：
 
 **关键代码**：`ui/src/common/ElevationForm.tsx:13-97`
 
 | OIDC 配置 | 提权流程 | 后端 API |
-|------------|---------|----------|
-| `oidc: false` | 仅显示"Elevate with Password"选项 | `POST /client/:id/elevate`（本地密码认证 |
+|-----------|---------|----------|
+| `oidc: false` | 仅显示"Elevate with Password"选项 | `POST /client/:id/elevate`（本地密码认证） |
 | `oidc: true` | 显示两个选项：<br>1. Elevate with Password<br>2. Elevate via OIDC（弹窗方式） | 1. `POST /client/:id/elevate`<br>2. `GET /auth/oidc/elevate` |
 
-**本地密码提权流程：
+**本地密码提权流程**：
+
+请求发起位置：`ui/src/ElevateStore.ts:34-45`
+
 ```typescript
-// ElevationForm.tsx:21-27
-const handleLocalElevate = async () => {
-    await axios.post(`${config.get('url')}client/${clientId}/elevate`, {durationSeconds});
+public localElevate = async (password: string, durationSeconds: number): Promise<void> => {
+    await axios.create().request({
+        url: `${config.get('url')}client/${this.currentUser.user.clientId}/elevate`,
+        method: 'POST',
+        data: {durationSeconds},
+        headers: {
+            Authorization: 'Basic ' + btoa(this.currentUser.user.name + ':' + password),
+        },
+    });
+    await this.currentUser.tryAuthenticate();
+    this.cleanupOidcElevate();
 };
 ```
 
-**OIDC 提权流程：
+**OIDC 提权流程**：
+
+请求发起位置：`ui/src/ElevateStore.ts:47-67`
+
 ```typescript
-// ElevationForm.tsx:47-67
 public oidcElevate = (durationSeconds: number): void => {
-    const url = config.get('url') + 'auth/oidc/elevate?id=' + clientId + '&durationSeconds=' + durationSeconds;
+    // prevent double execution
+    if (this.oidcElevatePending) return;
+
+    const url =
+        config.get('url') +
+        'auth/oidc/elevate?id=' +
+        this.currentUser.user.clientId +
+        '&durationSeconds=' +
+        durationSeconds;
+
     this.oidcPopup = window.open(url, 'gotify-oidc-elevate', 'width=600,height=700');
-    // 轮询检查弹窗关闭，完成后刷新用户状态
+    // ... 轮询检查弹窗关闭，完成后刷新用户状态
 };
 ```
 
