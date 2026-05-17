@@ -13,7 +13,8 @@
 │  3. 前端校验：name 非空 → 按钮可用                                           │
 │  4. 提交表单 → 调用 AppStore.create/update                                   │
 │  5. Axios 发送 HTTP 请求: POST /application 或 PUT /application/:id         │
-│  6. 接收响应 → refresh 刷新列表 → Snack 提示成功/失败                        │
+│  6. 成功: refresh刷新列表 → Snack提示成功                                    │
+│     失败: 全局axios拦截器处理 → Snack提示错误 → 异常向上冒泡                  │
 └───────────────────────────────────┬─────────────────────────────────────────┘
                                     │
                                     ▼
@@ -550,23 +551,69 @@ PUT /application/:id
 
 ## 九、前端Axios错误处理补充
 
-**文件**：`ui/src/application/AppStore.ts`
+### 9.1 全局响应拦截器（有代码证据）
 
-虽然前端代码中没有显式的 `.catch()` 处理，但由于是 `async/await` 调用，异常会向上冒泡，由上层错误边界或全局错误处理器处理：
+**初始化位置**：`ui/src/index.tsx:56` - 应用启动时调用 `initAxios(stores.currentUser, stores.snackManager.snack)`
+
+**拦截器定义**：`ui/src/apiAuth.ts:5-23`
+
+```typescript
+export const initAxios = (currentUser: CurrentUser, snack: SnackReporter) => {
+    axios.interceptors.response.use(undefined, (error) => {
+        if (!error.response) {
+            snack('Gotify server is not reachable, try refreshing the page.');
+            return Promise.reject(error);
+        }
+
+        const status = error.response.status;
+
+        if (status === 401) {
+            currentUser.tryAuthenticate().then(() => snack('Could not complete request.'));
+        }
+
+        if (status === 400 || status === 403 || status === 500) {
+            snack(error.response.data.error + ': ' + error.response.data.errorDescription);
+        }
+
+        return Promise.reject(error);
+    });
+};
+```
+
+**拦截器处理逻辑**：
+| 状态码 | 处理方式 |
+|-------|---------|
+| 无响应 | Snack提示"Gotify server is not reachable, try refreshing the page." |
+| 401 | 调用 `currentUser.tryAuthenticate()` 尝试重新认证 → Snack提示"Could not complete request." |
+| 400/403/500 | Snack显示后端返回的 `error: errorDescription` |
+
+### 9.2 AppStore调用链
+
+**文件**：`ui/src/application/AppStore.ts`
 
 ```typescript
 // AppStore.ts 中的调用链
 public create = async (name: string, description: string, defaultPriority: number): Promise<void> => {
-    await axios.post(...)      // HTTP错误会抛出异常
+    await axios.post(...)      // HTTP错误：拦截器处理Snack提示，异常继续抛出
     await this.refresh()       // 刷新失败也会抛出异常
     this.snack('Application created')  // 只有成功才执行
 }
 
+public update = async ({id, ...app}: Pick<...>): Promise<void> => {
+    await axios.put(`${config.get('url')}application/${id}`, app)
+    await this.refresh()
+    this.snack('Application updated')
+}
+
 // 调用处: AddApplicationDialog.tsx
 const submitAndClose = async () => {
-    await fOnSubmit(name, description, defaultPriority)  // 异常未捕获，向上传递
-    fClose()
+    await fOnSubmit(name, description, defaultPriority)  // 异常向上冒泡
+    fClose()  // 只有成功才关闭对话框
 }
 ```
 
-**注意**：前端实际部署中通常有全局axios拦截器处理HTTP错误，统一处理401重定向登录、403权限提示等。
+**关键点**：
+1. AppStore中未显式 `.catch()` 异常
+2. HTTP错误由全局axios拦截器处理Snack提示
+3. 拦截器 `return Promise.reject(error)` 继续抛出异常
+4. 异常向上冒泡，只有成功才会执行后续的 `refresh()` 和成功提示
