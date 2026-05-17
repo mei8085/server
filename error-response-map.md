@@ -30,7 +30,7 @@ type Error struct {
 
 ---
 
-## 2. 两类调用链路与错误传递机制
+## 2. 调用链路与错误传递机制
 
 ### 2.1 链路分类
 
@@ -89,13 +89,13 @@ ctx.AbortWithError(404, errors.New("application does not exist"))
 
 - 用于业务逻辑错误，如资源不存在、权限不足等
 - 会被错误中间件捕获并转为标准 Error 模型
-- 仅适用于链路 A（Axios API）
+- 适用于链路 A（Axios API）和 OIDC 提升入口
 
 **方式三：参数绑定错误**
 
 - 通过 `ctx.Bind()` / `ctx.MustBindWith()` 触发
 - 由 Gin 自动添加到错误队列，类型为 `gin.ErrorTypeBind`
-- 仅适用于链路 A（Axios API）
+- 适用于链路 A（Axios API）和 OIDC 提升入口
 
 **方式四：`http.Error()` 纯文本响应**
 
@@ -103,10 +103,10 @@ ctx.AbortWithError(404, errors.New("application does not exist"))
 http.Error(w, "invalid client name", http.StatusBadRequest)
 ```
 
-- 用于 OIDC 浏览器流程
+- 用于 OIDC 浏览器流程的回调阶段
 - 返回 `Content-Type: text/plain; charset=utf-8`
 - 绕过 Gin 错误队列和中间件
-- 适用于链路 B（浏览器跳转/弹窗）
+- 适用于链路 B（浏览器跳转/弹窗的回调阶段）
 
 **方式五：直接 `ctx.JSON()` 响应**
 
@@ -121,7 +121,7 @@ ctx.JSON(500, model.Health{Health: "orange", Database: "red"})
 
 #### 2.2.2 错误捕获中间件
 
-定义在 `error/handler.go:14-64`，**仅对链路 A 生效**：
+定义在 `error/handler.go:14-64`，**对链路 A 和 OIDC 提升入口生效**：
 
 ```go
 func Handler() gin.HandlerFunc {
@@ -175,8 +175,8 @@ g.Use(gin.LoggerWithFormatter(logFormatter), gin.Recovery(), gerror.Handler(), l
 
 **关键注意**：
 - 错误中间件在所有路由之前注册
-- 但链路 B（OIDC 浏览器流程）使用 `gin.WrapF()` 包装 `http.HandlerFunc`，绕过了 Gin 的错误机制
-- 链路 C（健康检查）直接写入响应，不调用 `AbortWithError`
+- 但 OIDC 回调使用 `gin.WrapF()` 包装 `http.HandlerFunc`，绕过了 Gin 的错误机制
+- 健康检查直接写入响应，不调用 `AbortWithError`
 
 ---
 
@@ -275,27 +275,110 @@ g.Use(gin.LoggerWithFormatter(logFormatter), gin.Recovery(), gerror.Handler(), l
 | `POST /auth/oidc/external/token` | token 交换失败 | 401 | `"token exchange failed: ..."` | ✅ Error |
 | `POST /auth/oidc/external/token` | 用户信息获取失败 | 500 | `"failed to get user info: ..."` | ✅ Error |
 | `POST /auth/oidc/external/token` | 用户不存在/自动注册关闭 | 403 | `"user does not exist and auto-registration is disabled"` | ✅ Error |
-| `GET /auth/oidc/elevate` | 参数绑定失败 | 400 | 绑定错误详情 | ✅ Error |
-| `GET /auth/oidc/elevate` | 状态生成失败 | 500 | 错误原文 | ✅ Error |
 
-#### 3.9.2 OIDC 浏览器接口（登录/回调）- 链路 B ⚠️
+#### 3.9.2 OIDC 提升流程（两段链路拆分）
 
-| 接口 | 错误场景 | 状态码 | 响应内容 | 响应模型 |
-|------|----------|--------|----------|----------|
-| `GET /auth/oidc/login` | 缺少 client name | 400 | `"invalid client name"`（纯文本） | ❌ text/plain |
-| `GET /auth/oidc/login` | 状态生成失败 | 500 | `"failed to generate state: ..."`（纯文本） | ❌ text/plain |
-| `GET /auth/oidc/callback` | 用户解析失败 | 403/500 | 错误详情（纯文本） | ❌ text/plain |
-| `GET /auth/oidc/callback` | state 无效/过期 | 400 | `"unknown or expired state"`（纯文本） | ❌ text/plain |
-| `GET /auth/oidc/callback` | 客户端创建失败 | 500 | `"failed to create client: ..."`（纯文本） | ❌ text/plain |
-| `GET /auth/oidc/callback`（提升流程）| 数据库错误 | 500 | `"database error: ..."`（纯文本） | ❌ text/plain |
-| `GET /auth/oidc/callback`（提升流程）| 客户端不存在 | 404 | `"client not found"`（纯文本） | ❌ text/plain |
-| `GET /auth/oidc/callback`（提升流程）| 提升失败 | 500 | `"failed to elevate session: ..."`（纯文本） | ❌ text/plain |
+**阶段一：提升入口 `/auth/oidc/elevate` - 链路 A ✅**
 
-**关键差异**：
-- OIDC 浏览器流程使用 `gin.WrapF()` 包装标准 `http.HandlerFunc`
-- 错误时调用 `http.Error()`，返回 `Content-Type: text/plain; charset=utf-8`
-- 纯文本格式，不是 JSON，也不包含 Error 模型字段
-- 绕过 Gin 错误队列和中间件，直接写入 HTTP 响应
+`api/oidc.go:160-172` 是**原生 Gin handler**，不是 `gin.WrapF` 包装的：
+
+```go
+func (a *OIDCAPI) ElevateHandler(ctx *gin.Context) {
+    var elevate pendingElevation
+    if err := ctx.BindQuery(&elevate); err != nil {
+        return  // Gin 自动处理，转为 Error 模型
+    }
+    state, err := a.generateState()
+    if err != nil {
+        ctx.AbortWithError(http.StatusInternalServerError, err)  // 标准 Error 模型
+        return
+    }
+    // ... 重定向到 OIDC provider
+}
+```
+
+| 错误场景 | 状态码 | 错误信息 | 响应模型 |
+|----------|--------|----------|----------|
+| 参数绑定失败（缺少 `id` 或 `durationSeconds`） | 400 | 校验错误详情（如 "Field 'id' is required"） | ✅ Error |
+| 状态生成失败 | 500 | 错误原文 | ✅ Error |
+
+**✅ 阶段一结论**：提升入口的错误返回标准 `model.Error` JSON，经过错误中间件处理。
+
+---
+
+**阶段二：提升回调 `/auth/oidc/callback` - 链路 B ⚠️**
+
+`api/oidc.go:202-233` 使用 `gin.WrapF` 包装，所有错误使用 `http.Error()` 返回纯文本：
+
+```go
+func (a *OIDCAPI) CallbackHandler() gin.HandlerFunc {
+    callback := func(w http.ResponseWriter, r *http.Request, ...) {
+        // 用户解析失败
+        user, status, err := a.resolveUser(info)
+        if err != nil {
+            http.Error(w, err.Error(), status)  // 纯文本
+            return
+        }
+        // state 无效/过期
+        session, ok := a.popPendingSession(state)
+        if !ok {
+            http.Error(w, "unknown or expired state", http.StatusBadRequest)  // 纯文本
+            return
+        }
+        // 提升回调
+        if session.Elevate != nil {
+            a.handleElevationCallback(w, session.Elevate, user)  // 纯文本错误
+            return
+        }
+        // ...
+    }
+    return gin.WrapF(rp.CodeExchangeHandler(rp.UserinfoCallback(callback), a.Provider))
+}
+```
+
+`handleElevationCallback` (`api/oidc.go:235-266`) 中的错误：
+
+| 错误场景 | 状态码 | 响应内容 | 响应模型 |
+|----------|--------|----------|----------|
+| 数据库查询错误 | 500 | `"database error: ..."`（纯文本） | ❌ text/plain |
+| 客户端不存在或不属于当前用户 | 404 | `"client not found"`（纯文本） | ❌ text/plain |
+| 提升会话更新失败 | 500 | `"failed to elevate session: ..."`（纯文本） | ❌ text/plain |
+
+**⚠️ 阶段二结论**：提升回调的所有错误均为 `text/plain` 纯文本，绕过错误中间件。
+
+#### 3.9.3 OIDC 登录流程 - 链路 B ⚠️
+
+**阶段一：登录入口 `/auth/oidc/login` - 链路 B ⚠️**
+
+`api/oidc.go:115-130` 使用 `gin.WrapF` 包装：
+
+| 错误场景 | 状态码 | 响应内容 | 响应模型 |
+|----------|--------|----------|----------|
+| 缺少 client name | 400 | `"invalid client name"`（纯文本） | ❌ text/plain |
+| 状态生成失败 | 500 | `"failed to generate state: ..."`（纯文本） | ❌ text/plain |
+
+**阶段二：登录回调 `/auth/oidc/callback` - 链路 B ⚠️**
+
+与提升回调共用同一个 handler，错误也为纯文本：
+
+| 错误场景 | 状态码 | 响应内容 | 响应模型 |
+|----------|--------|----------|----------|
+| 用户解析失败 | 403/500 | 错误详情（纯文本） | ❌ text/plain |
+| state 无效/过期 | 400 | `"unknown or expired state"`（纯文本） | ❌ text/plain |
+| 客户端创建失败 | 500 | `"failed to create client: ..."`（纯文本） | ❌ text/plain |
+
+#### 3.9.4 OIDC 各接口错误格式汇总
+
+| 接口 | 阶段 | 错误格式 | 经过中间件 |
+|------|------|----------|-----------|
+| `GET /auth/oidc/login` | 入口 | ❌ text/plain | 否 |
+| `GET /auth/oidc/callback`（登录） | 回调 | ❌ text/plain | 否 |
+| `GET /auth/oidc/elevate` | 入口 | ✅ model.Error JSON | 是 |
+| `GET /auth/oidc/callback`（提升） | 回调 | ❌ text/plain | 否 |
+| `POST /auth/oidc/external/authorize` | 全部 | ✅ model.Error JSON | 是 |
+| `POST /auth/oidc/external/token` | 全部 | ✅ model.Error JSON | 是 |
+
+**关键修正**：OIDC 提升流程**不是全程 text/plain**，入口阶段（`/auth/oidc/elevate`）返回标准 Error JSON，只有回调阶段（`/auth/oidc/callback`）才返回纯文本。
 
 ### 3.10 通用工具错误 - 链路 A
 
@@ -312,8 +395,8 @@ g.Use(gin.LoggerWithFormatter(logFormatter), gin.Recovery(), gerror.Handler(), l
 
 | 维度 | 统一程度 | 说明 |
 |------|----------|------|
-| **响应结构（链路 A）** | ✅ 完全统一 | 所有 Axios API 错误均使用 `model.Error` 结构 |
-| **响应结构（整体）** | ⚠️ 大部分统一 | 链路 B/C 例外：OIDC 返回纯文本，健康检查返回 Health 模型 |
+| **响应结构（链路 A）** | ✅ 完全统一 | 所有 Axios API 和 OIDC 提升入口错误均使用 `model.Error` 结构 |
+| **响应结构（整体）** | ⚠️ 大部分统一 | OIDC 登录入口和所有回调阶段返回纯文本，健康检查返回 Health 模型 |
 | **HTTP 状态码** | ✅ 基本统一 | 同类错误使用相同状态码（404 资源不存在、400 参数错误等） |
 | **错误描述风格** | ⚠️ 部分不统一 | 相同语义的错误信息有多种表述 |
 | **调用链路** | ❌ 不统一 | 三种不同的调用和错误传递机制 |
@@ -325,7 +408,7 @@ g.Use(gin.LoggerWithFormatter(logFormatter), gin.Recovery(), gerror.Handler(), l
 │                     错误响应路径分类                          │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
-│  路径 A：标准路径（链路 A，95% API）                          │
+│  路径 A：标准路径（链路 A，95% API + OIDC 提升入口）          │
 │  ───────────────────────────────────────────────────────    │
 │  控制器 → ctx.AbortWithError() → Gin 错误队列 → 中间件       │
 │         → writeError() → model.Error JSON                   │
@@ -335,7 +418,7 @@ g.Use(gin.LoggerWithFormatter(logFormatter), gin.Recovery(), gerror.Handler(), l
 │  控制器 → ctx.JSON() → model.Health JSON（即使 500）        │
 │         （绕过错误中间件）                                   │
 │                                                             │
-│  路径 C：OIDC 浏览器流程（链路 B）                            │
+│  路径 C：OIDC 浏览器流程（链路 B 的回调阶段）                 │
 │  ───────────────────────────────────────────────────────    │
 │  控制器 → http.Error() → text/plain 纯文本                  │
 │         （绕过 Gin 错误队列和中间件）                        │
@@ -350,8 +433,9 @@ g.Use(gin.LoggerWithFormatter(logFormatter), gin.Recovery(), gerror.Handler(), l
 | 链路 | 调用方式 | 错误格式 | 经过 axios 拦截器 |
 |------|----------|----------|-----------------|
 | 链路 A（Axios API） | `axios.get()` / `axios.post()` | `model.Error` JSON | ✅ 是 |
-| 链路 B（OIDC 登录） | `<a href="...">` 页面跳转 | `text/plain` | ❌ 否，直接显示在页面 |
-| 链路 B（OIDC 提升） | `window.open()` 弹窗 | `text/plain` | ❌ 否，显示在弹窗中 |
+| 链路 A（OIDC 提升入口） | `window.open()` 弹窗加载 | `model.Error` JSON | ❌ 否，显示在弹窗中 |
+| 链路 B（OIDC 登录入口） | `<a href="...">` 页面跳转 | `text/plain` | ❌ 否，直接显示在页面 |
+| 链路 B（OIDC 回调） | 浏览器/弹窗跳转 | `text/plain` | ❌ 否，显示在浏览器/弹窗中 |
 | 链路 C（健康检查） | 可通过 axios 或直接访问 | `model.Health` JSON | ⚠️ 如果 axios 调用则经过，但格式不匹配 |
 
 #### 4.3.2 响应模型不统一
@@ -359,9 +443,11 @@ g.Use(gin.LoggerWithFormatter(logFormatter), gin.Recovery(), gerror.Handler(), l
 | 接口类别 | 错误模型 | Content-Type |
 |----------|----------|-------------|
 | 消息/应用/客户端/用户/插件/会话 API | ✅ `model.Error` | `application/json` |
-| 健康检查 API | ❌ `model.Health` | `application/json` |
+| OIDC 提升入口 | ✅ `model.Error` | `application/json` |
 | OIDC 外部 API | ✅ `model.Error` | `application/json` |
-| OIDC 浏览器 API | ❌ 纯文本 | `text/plain` |
+| OIDC 登录入口 | ❌ 纯文本 | `text/plain` |
+| OIDC 回调（登录+提升） | ❌ 纯文本 | `text/plain` |
+| 健康检查 API | ❌ `model.Health` | `application/json` |
 
 #### 4.3.3 资源不存在的错误信息不统一
 
@@ -404,23 +490,25 @@ g.Use(gin.LoggerWithFormatter(logFormatter), gin.Recovery(), gerror.Handler(), l
 
 - ✅ 统一的格式化输出
 - ✅ 字段名自动转为小写开头（camelCase）
+- ✅ 适用于所有使用 `ctx.Bind` 的接口，包括 OIDC 提升入口
 
 ---
 
-## 5. 对客户端 UI 的影响（深度分析）
+## 5. 对客户端 UI 的影响（深度校正）
 
 ### 5.1 前端调用方式汇总
 
-| 功能 | 调用方式 | 链路类型 |
-|------|----------|----------|
-| 获取消息列表 | `axios.get('/message')` | 链路 A |
-| 创建应用 | `axios.post('/application')` | 链路 A |
-| 删除客户端 | `axios.delete('/client/{id}')` | 链路 A |
-| 本地登录 | `axios.post('/auth/local/login')` | 链路 A |
-| 本地提升权限 | `axios.post('/client/{id}/elevate')` | 链路 A |
-| **OIDC 登录** | **`<a href="/auth/oidc/login">` 页面跳转** | **链路 B** |
-| **OIDC 提升权限** | **`window.open('/auth/oidc/elevate')` 弹窗** | **链路 B** |
-| 健康检查 | 未在 UI 中直接调用 | 链路 C |
+| 功能 | 调用方式 | 链路类型 | 错误格式 |
+|------|----------|----------|----------|
+| 获取消息列表 | `axios.get('/message')` | 链路 A | ✅ Error JSON |
+| 创建应用 | `axios.post('/application')` | 链路 A | ✅ Error JSON |
+| 删除客户端 | `axios.delete('/client/{id}')` | 链路 A | ✅ Error JSON |
+| 本地登录 | `axios.post('/auth/local/login')` | 链路 A | ✅ Error JSON |
+| 本地提升权限 | `axios.post('/client/{id}/elevate')` | 链路 A | ✅ Error JSON |
+| **OIDC 登录** | **`<a href="/auth/oidc/login">` 页面跳转** | **链路 B** | **❌ 纯文本** |
+| **OIDC 提升权限（入口）** | **`window.open('/auth/oidc/elevate')` 弹窗** | **链路 A** | **✅ Error JSON（显示在弹窗）** |
+| **OIDC 提升权限（回调）** | **弹窗内跳转** | **链路 B** | **❌ 纯文本（显示在弹窗）** |
+| 健康检查 | 未在 UI 中直接调用 | 链路 C | ❌ Health JSON |
 
 ### 5.2 Axios 拦截器处理逻辑（链路 A）
 
@@ -447,7 +535,7 @@ axios.interceptors.response.use(undefined, (error) => {
 });
 ```
 
-**适用范围**：仅对通过 axios 发起的请求生效（链路 A）。
+**适用范围**：仅对通过 axios 发起的请求生效。**不适用**于通过 `<a href>` 跳转或 `window.open()` 打开的页面。
 
 ### 5.3 各链路错误在 UI 中的实际表现
 
@@ -464,7 +552,7 @@ axios.interceptors.response.use(undefined, (error) => {
 Bad Request: Field 'name' is required
 ```
 
-#### 5.3.2 链路 B（OIDC 浏览器流程）- ⚠️ 独立处理
+#### 5.3.2 OIDC 登录流程 - 🔴 纯文本错误页
 
 **OIDC 登录流程**（`ui/src/user/Login.tsx:84-100`）：
 ```tsx
@@ -477,7 +565,7 @@ Bad Request: Field 'name' is required
 </Button>
 ```
 
-- 点击按钮后，**整页跳转**到 OIDC 登录页面
+- 点击按钮后，**整页跳转**到 `/auth/oidc/login`
 - 如果 `/auth/oidc/login` 出错（如缺少 name 参数）：
   - 浏览器显示 Go 默认错误页面（白底黑字的纯文本）
   - **不会经过 axios 拦截器**
@@ -488,6 +576,8 @@ Bad Request: Field 'name' is required
 - 如果 OIDC 回调 `/auth/oidc/callback` 出错：
   - 同样显示纯文本错误页面
   - 用户无法回到应用，只能手动返回
+
+#### 5.3.3 OIDC 提升流程 - 🟡 分阶段处理
 
 **OIDC 提升流程**（`ui/src/ElevateStore.ts:47-101`）：
 
@@ -516,18 +606,41 @@ private checkOidcPopup = async () => {
 };
 ```
 
-- 点击 "Elevate via OIDC" 按钮后，**打开新弹窗**
-- 如果 `/auth/oidc/elevate` 或 `/auth/oidc/callback` 出错：
-  - 错误显示在**弹窗**中（纯文本）
-  - 主窗口**无法获取弹窗中的错误信息**（跨域安全限制）
-  - 主窗口轮询检查弹窗是否关闭
-  - 如果弹窗关闭但未提升成功，显示**通用错误**：
-    ```
-    OIDC elevation was not completed.
-    ```
-  - **具体错误原因不会传递到主窗口**
+**阶段一：提升入口错误（`/auth/oidc/elevate`）**
 
-#### 5.3.3 链路 C（健康检查）- ⚠️ 格式不匹配
+- 用户点击 "Elevate via OIDC" 按钮，`window.open()` 打开弹窗
+- 如果入口参数错误或状态生成失败：
+  - **弹窗内显示标准 Error JSON**（因为入口是原生 Gin handler）
+  - 弹窗内容示例：
+    ```json
+    {"error":"Bad Request","errorCode":400,"errorDescription":"Field 'id' is required"}
+    ```
+  - 这是原始 JSON，没有格式化，用户体验差
+  - 主窗口**无法读取弹窗内容**（即使是同源，也需要弹窗主动通信）
+
+**阶段二：提升回调错误（`/auth/oidc/callback`）**
+
+- 用户在 OIDC provider 认证后，弹窗跳转到回调接口
+- 如果回调出错：
+  - **弹窗内显示纯文本错误**
+  - 示例：
+    ```
+    client not found
+    ```
+  - 主窗口同样无法读取弹窗内容
+
+**阶段三：弹窗关闭后的主窗口处理**
+
+- 主窗口轮询检查弹窗是否关闭
+- 无论弹窗中发生了什么错误，主窗口都**无法获取具体错误信息**
+- 如果弹窗关闭但未提升成功，主窗口只显示通用错误：
+  ```
+  OIDC elevation was not completed.
+  ```
+
+**✅ 校正结论**：OIDC 提升流程不是全程纯文本。入口错误显示 JSON（用户体验差），回调错误显示纯文本，两者都不会传递到主窗口。
+
+#### 5.3.4 链路 C（健康检查）- ⚠️ 格式不匹配
 
 健康检查未在 UI 中直接调用，但如果通过 axios 调用：
 
@@ -545,20 +658,22 @@ axios.get('/health')
 
 在 `ui/src/types.ts` 中**没有**定义 Error 接口类型，UI 直接访问 `error.response.data.error` 和 `error.response.data.errorDescription`。
 
-### 5.5 影响评估（重新评估）
+### 5.5 影响评估（校正后）
 
 | 影响点 | 说明 | 严重程度 |
 |--------|------|----------|
 | **OIDC 登录错误体验** | 出错时显示浏览器默认纯文本页面，用户体验差，无法返回应用 | 🔴 高 |
-| **OIDC 提升错误不透明** | 弹窗出错时主窗口只能显示通用错误，无法告知具体原因 | 🟡 中 |
-| **健壮性** | 三种不同的错误处理路径，增加了维护复杂度 | 🟡 中 |
+| **OIDC 提升入口错误** | 参数错误时弹窗内显示原始 JSON，用户无法理解 | 🔴 高 |
+| **OIDC 提升回调错误** | 弹窗内显示纯文本错误，用户体验差 | 🟡 中 |
+| **OIDC 提升错误不透明** | 主窗口无法获取弹窗中的具体错误，只能显示通用提示 | 🟡 中 |
+| **健壮性** | 多种错误处理路径，增加了维护复杂度 | 🟡 中 |
 | **健康检查兼容性** | 如果 UI 将来调用健康检查，500 时会显示 `undefined: undefined` | 🟡 中 |
 | **国际化** | 硬编码的英文错误信息难以进行多语言支持 | 🟡 中 |
 | **调试友好** | `errorDescription` 详细信息有助于开发调试（链路 A） | ✅ 好 |
 
 ---
 
-## 6. 对第三方接入方的影响（重新评估）
+## 6. 对第三方接入方的影响（校正后）
 
 ### 6.1 API 文档
 
@@ -578,7 +693,9 @@ responses:
 
 **文档与实际不符**：
 - 健康检查接口文档声明 500 返回 `Health` 模型（文档正确）
-- OIDC 浏览器接口文档声明错误返回 `Error` 模型，但实际返回纯文本（文档错误）
+- OIDC 登录入口文档声明错误返回 `Error` 模型，但实际返回纯文本（文档错误）
+- OIDC 提升入口文档声明错误返回 `Error` 模型，**实际也返回 Error 模型**（文档正确 ✅）
+- OIDC 回调文档声明错误返回 `Error` 模型，但实际返回纯文本（文档错误）
 
 ### 6.2 接入方分类与影响
 
@@ -591,11 +708,17 @@ responses:
 
 #### 6.2.2 Web 应用（Browser）- 使用 OIDC 浏览器流程
 
-使用 `GET /auth/oidc/login` 和 `GET /auth/oidc/callback`：
-- ❌ 错误返回 `text/plain` 纯文本
-- ❌ 需要自行解析纯文本错误
-- ❌ 文档与实现不一致
-- ⚠️ 需要处理页面跳转后的错误显示
+使用 `GET /auth/oidc/login`、`GET /auth/oidc/elevate` 和 `GET /auth/oidc/callback`：
+
+| 接口 | 文档声明 | 实际返回 | 是否一致 |
+|------|----------|----------|---------|
+| `GET /auth/oidc/login` | Error 模型 | 纯文本 | ❌ 不一致 |
+| `GET /auth/oidc/elevate` | Error 模型 | Error 模型 | ✅ 一致 |
+| `GET /auth/oidc/callback` | Error 模型 | 纯文本 | ❌ 不一致 |
+
+- ⚠️ 需要处理两种错误格式：提升入口是 JSON，登录入口和回调是纯文本
+- ⚠️ 回调错误显示在浏览器/弹窗中，应用无法通过 JS 获取
+- ❌ 文档与实现部分不一致
 
 #### 6.2.3 系统集成（System Integration）- 调用业务 API
 
@@ -612,7 +735,7 @@ responses:
 
 ### 6.3 接入方处理建议
 
-**修正后的 Python 客户端错误处理**：
+**校正后的 Python 客户端错误处理**：
 
 ```python
 import requests
@@ -635,7 +758,7 @@ class GotifyHealthError(Exception):
         super().__init__(f"Health check failed: health={health}, database={database}")
 
 class GotifyOIDCError(Exception):
-    """OIDC 浏览器流程错误"""
+    """OIDC 浏览器流程纯文本错误"""
     def __init__(self, status_code: int, error_text: str):
         self.status_code = status_code
         self.error_text = error_text
@@ -652,7 +775,7 @@ def handle_response(response: requests.Response) -> Dict[str, Any]:
         return {}
     
     # 错误响应处理
-    # 1. OIDC 浏览器流程: text/plain
+    # 1. OIDC 浏览器流程回调阶段: text/plain
     if 'text/plain' in content_type:
         raise GotifyOIDCError(response.status_code, response.text)
     
@@ -673,7 +796,7 @@ def handle_response(response: requests.Response) -> Dict[str, Any]:
             database=data['database']
         )
     
-    # 4. 标准 API 错误: model.Error
+    # 4. 标准 API 错误 / OIDC 提升入口: model.Error
     if 'errorCode' in data:
         raise GotifyApiError(
             error_code=data['errorCode'],
@@ -688,6 +811,36 @@ def handle_response(response: requests.Response) -> Dict[str, Any]:
         error_description=f"Response: {json.dumps(data)[:200]}"
     )
 
+# OIDC 提升流程示例
+def elevate_with_oidc(client_id: int, duration_seconds: int):
+    """
+    OIDC 提升流程注意事项：
+    1. 提升入口 /auth/oidc/elevate 返回标准 Error JSON
+    2. 回调 /auth/oidc/callback 返回纯文本错误
+    3. 回调错误显示在浏览器中，应用无法通过 API 获取
+    """
+    base_url = "https://gotify.example.com"
+    
+    # 阶段一：调用提升入口（可能返回 Error JSON）
+    try:
+        response = requests.get(
+            f"{base_url}/auth/oidc/elevate",
+            params={"id": client_id, "durationSeconds": duration_seconds}
+        )
+        handle_response(response)  # 如果入口出错，抛出 GotifyApiError
+        authorize_url = response.url  # 重定向到 OIDC provider 的 URL
+        print(f"请在浏览器中访问: {authorize_url}")
+    except GotifyApiError as e:
+        print(f"提升入口错误: {e.error_code} - {e.error}")
+        print(f"详情: {e.error_description}")
+        return False
+    
+    # 阶段二：用户在浏览器中完成认证
+    # 回调错误会显示在浏览器中，应用无法捕获
+    # 需要用户手动确认是否成功
+    
+    return True
+
 # 使用示例
 try:
     response = requests.get('https://gotify.example.com/message')
@@ -700,16 +853,17 @@ except GotifyHealthError as e:
     print(f"Health Check Failed: {e.health}")
     print(f"Database Status: {e.database}")
 except GotifyOIDCError as e:
-    print(f"OIDC Error: {e.status_code}")
+    print(f"OIDC Callback Error: {e.status_code}")
     print(f"Error: {e.error_text}")
 ```
 
-### 6.4 影响评估（重新评估）
+### 6.4 影响评估（校正后）
 
 | 影响点 | 说明 | 严重程度 |
 |--------|------|----------|
-| **集成复杂度** | 需要处理三种不同的错误响应格式，增加了集成代码的复杂度 | 🔴 高 |
-| **文档一致性** | OIDC 浏览器接口的 Swagger 文档与实际响应不符，误导接入方 | 🔴 高 |
+| **集成复杂度** | 需要处理三种不同的错误响应格式（Error JSON / Health JSON / text/plain） | 🔴 高 |
+| **文档一致性** | OIDC 登录入口和回调的 Swagger 文档与实际响应不符，误导接入方 | 🔴 高 |
+| **OIDC 提升入口** | 文档与实现一致，返回标准 Error JSON，处理简单 | ✅ 无问题 |
 | **错误恢复** | 链路 A：401 可触发刷新 token，400 需检查参数，500 需重试 | 🟡 中 |
 | **版本兼容性** | 错误结构稳定，但错误信息文本可能随版本变化，依赖字符串匹配较脆弱 | 🟡 中 |
 | **监控告警** | 链路 A：可基于 `errorCode` 分类统计；健康检查需检查响应体字段 | ✅ 好 |
@@ -718,9 +872,9 @@ except GotifyOIDCError as e:
 
 ## 7. 改进建议
 
-### 7.1 统一错误响应模型（最高优先级）
+### 7.1 统一 OIDC 错误响应模型（最高优先级）
 
-**问题**：健康检查和 OIDC 浏览器流程绕过错误中间件，返回非标准格式
+**问题**：OIDC 登录入口和回调阶段返回纯文本，与文档和其他接口不一致
 
 **建议**：
 
@@ -744,7 +898,6 @@ func (a *OIDCAPI) LoginHandler() gin.HandlerFunc {
             ClientName: clientName, 
             CreatedAt: time.Now(),
         })
-        // 使用 gin 方式重定向到 OIDC provider
         rp.AuthURLHandler(func() string { return state }, a.Provider)(
             ctx.Writer, ctx.Request,
         )
@@ -757,14 +910,13 @@ func (a *OIDCAPI) LoginHandler() gin.HandlerFunc {
 **优点**：
 - 统一使用 Error 模型
 - 错误经过中间件处理
-- 前端可以通过 JSON 解析错误
+- 文档与实现一致
 
 #### 方案 B：OIDC 浏览器流程错误时重定向回 UI 并携带错误参数
 
 ```go
 // 出错时不直接返回错误，而是重定向回 UI 并在 query 中携带错误信息
 func callbackError(w http.ResponseWriter, errMsg string, status int) {
-    // 重定向到 UI 错误页面
     redirectURL := fmt.Sprintf("../../?error=%s&status=%d", 
         url.QueryEscape(errMsg), status)
     http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
@@ -772,28 +924,19 @@ func callbackError(w http.ResponseWriter, errMsg string, status int) {
 ```
 
 **优点**：
-- 用户不会看到纯文本错误页面
+- 用户不会看到纯文本错误页面或原始 JSON
 - UI 可以统一处理错误显示
 
-#### 方案 C：健康检查失败时也返回 Error 模型
+#### 方案 C：OIDC 提升弹窗使用 postMessage 通信
 
-```go
-// api/health.go
-func (a *HealthAPI) Health(ctx *gin.Context) {
-    if err := a.DB.Ping(); err != nil {
-        ctx.AbortWithError(500, errors.New("database connection failed"))
-        return
-    }
-    ctx.JSON(200, model.Health{
-        Health:   model.StatusGreen,
-        Database: model.StatusGreen,
-    })
-}
+如果后端不便修改，可以在前端改进弹窗通信：
+
+```typescript
+// 弹窗关闭前向主窗口发送错误信息
+// 在弹窗页面中注入脚本，在错误时通过 postMessage 发送错误
 ```
 
-**注意**：这会改变健康检查的语义，需要评估对现有监控系统的影响。
-
-### 7.2 前端 OIDC 错误处理改进
+### 7.2 前端 OIDC 提升错误提示改进
 
 在后端未统一之前，前端可以改进 OIDC 提升流程的错误提示：
 
@@ -813,15 +956,39 @@ private checkOidcPopup = async () => {
     }
 
     if (!this.elevated) {
-        // 改进错误提示，引导用户
+        // 改进错误提示，引导用户查看弹窗
         this.snack('OIDC elevation was not completed. ' +
-                  'If an error occurred, it was shown in the popup window.');
+                  'If an error occurred, details were shown in the popup window.');
     }
     this.cleanupOidcElevate();
 };
 ```
 
-### 7.3 错误信息标准化
+### 7.3 健康检查接口改进
+
+**方案 A：健康检查失败时也返回 Error 模型**
+
+```go
+// api/health.go
+func (a *HealthAPI) Health(ctx *gin.Context) {
+    if err := a.DB.Ping(); err != nil {
+        ctx.AbortWithError(500, errors.New("database connection failed"))
+        return
+    }
+    ctx.JSON(200, model.Health{
+        Health:   model.StatusGreen,
+        Database: model.StatusGreen,
+    })
+}
+```
+
+**注意**：这会改变健康检查的语义，需要评估对现有监控系统的影响。
+
+**方案 B：保持现状但在文档中明确说明**
+
+如果为了兼容现有监控系统，可以保持现状，但在文档中明确说明健康检查的错误格式。
+
+### 7.4 错误信息标准化
 
 **问题**：相同语义的错误信息表述不统一
 
@@ -839,7 +1006,7 @@ const (
 )
 ```
 
-### 7.4 增加业务错误码
+### 7.5 增加业务错误码
 
 **问题**：仅靠 HTTP 状态码和错误描述无法精确定位错误类型
 
@@ -854,7 +1021,7 @@ type Error struct {
 }
 ```
 
-### 7.5 敏感错误包装
+### 7.6 敏感错误包装
 
 **问题**：500 错误直接暴露数据库错误详情
 
@@ -882,7 +1049,7 @@ func writeError(ctx *gin.Context, errString string) {
 }
 ```
 
-### 7.6 UI 端健壮性改进
+### 7.7 UI 端健壮性改进
 
 **建议**：增加响应格式检查，处理非标准错误响应
 
@@ -926,46 +1093,58 @@ if (status === 400 || status === 403 || status === 500) {
 
 ## 8. 总结
 
-### 8.1 两类调用链路的本质区别
+### 8.1 OIDC 提升流程的两段链路校正
+
+| 阶段 | 接口 | handler 类型 | 错误格式 | 经过中间件 |
+|------|------|-------------|----------|-----------|
+| 入口 | `GET /auth/oidc/elevate` | 原生 Gin handler | ✅ `model.Error` JSON | 是 |
+| 回调 | `GET /auth/oidc/callback` | `gin.WrapF` 包装 | ❌ `text/plain` 纯文本 | 否 |
+
+**✅ 重要校正**：OIDC 提升流程**不是全程 text/plain**。入口阶段返回标准 Error JSON，只有回调阶段才返回纯文本。
+
+### 8.2 两类调用链路的本质区别
 
 | 维度 | Axios API 链路（链路 A） | 浏览器跳转/弹窗链路（链路 B） |
 |------|-------------------------|-----------------------------|
 | **调用方式** | `axios.get/post()` | `<a href>` / `window.open()` |
-| **错误格式** | `model.Error` JSON | `text/plain` 纯文本 |
+| **错误格式** | `model.Error` JSON | 登录入口+回调: text/plain；提升入口: Error JSON |
 | **经过拦截器** | ✅ 是 | ❌ 否 |
 | **错误处理** | 前端统一拦截、格式化显示 | 浏览器直接渲染 / 主窗口无法获取 |
-| **用户体验** | 错误以 snackbar 形式友好展示 | 跳转时显示纯文本错误页 / 弹窗错误不透明 |
-| **占比** | ~95% 接口 | 2 个接口（OIDC 登录/回调） |
+| **用户体验** | 错误以 snackbar 形式友好展示 | 跳转时显示纯文本/JSON，弹窗错误不透明 |
+| **占比** | ~95% 接口 + OIDC 提升入口 | OIDC 登录入口 + 所有回调 |
 
-### 8.2 优点
+### 8.3 优点
 
 1. **Axios API 结构统一**：绝大多数 API 错误响应使用相同的 JSON 结构
-2. **链路清晰**：标准路径下控制器 → 中间件 → 响应，流程明确
-3. **HTTP 友好**：错误码与 HTTP 语义一致
-4. **调试便利**：`errorDescription` 提供详细上下文（标准 API）
+2. **OIDC 提升入口规范**：提升入口返回标准 Error 模型，与文档一致
+3. **链路清晰**：标准路径下控制器 → 中间件 → 响应，流程明确
+4. **HTTP 友好**：错误码与 HTTP 语义一致
+5. **调试便利**：`errorDescription` 提供详细上下文（标准 API）
 
-### 8.3 不足（按严重程度排序）
+### 8.4 不足（按严重程度排序）
 
-1. 🔴 **OIDC 浏览器流程错误体验差**：出错时显示纯文本页面或错误不透明，用户体验差
-2. 🔴 **文档与实现不一致**：OIDC 浏览器接口文档声明返回 Error 模型，但实际返回纯文本
-3. 🟡 **响应模型不统一**：三种不同的错误响应格式，增加客户端集成复杂度
-4. 🟡 **错误信息不统一**：相同类型错误的描述文本不一致
-5. 🟡 **缺少业务错误码**：第三方接入方难以精确判断错误类型
-6. 🟡 **敏感信息暴露**：500 错误直接返回内部错误详情
-7. 🟡 **国际化困难**：硬编码英文错误信息
+1. 🔴 **OIDC 登录入口错误体验差**：出错时显示纯文本页面
+2. 🔴 **OIDC 提升入口错误显示原始 JSON**：用户无法理解
+3. 🔴 **OIDC 回调错误纯文本**：用户体验差，主窗口无法捕获
+4. 🔴 **文档与实现部分不一致**：OIDC 登录入口和回调的 Swagger 文档错误
+5. 🟡 **响应模型不统一**：三种不同的错误响应格式，增加客户端集成复杂度
+6. 🟡 **错误信息不统一**：相同类型错误的描述文本不一致
+7. 🟡 **缺少业务错误码**：第三方接入方难以精确判断错误类型
+8. 🟡 **敏感信息暴露**：500 错误直接返回内部错误详情
+9. 🟡 **国际化困难**：硬编码英文错误信息
 
-### 8.4 关键文件速查
+### 8.5 关键文件速查
 
 | 文件 | 职责 |
 |------|------|
 | `model/error.go` | 标准错误响应模型定义 |
 | `model/health.go` | 健康检查模型定义（非错误） |
-| `error/handler.go` | 全局错误处理中间件（仅链路 A） |
+| `error/handler.go` | 全局错误处理中间件（链路 A + OIDC 提升入口） |
 | `api/errorHandling.go` | 控制器错误抛出工具 |
 | `api/health.go` | 健康检查接口（绕过错误中间件） |
-| `api/oidc.go` | OIDC 接口（浏览器流程绕过错误中间件） |
+| `api/oidc.go` | OIDC 接口（提升入口为原生 Gin handler，登录入口和回调为 gin.WrapF） |
 | `router/router.go` | 中间件注册、路由定义 |
 | `auth/authentication.go` | 认证相关错误抛出 |
-| `ui/src/apiAuth.ts` | 前端 axios 错误拦截器（仅链路 A） |
+| `ui/src/apiAuth.ts` | 前端 axios 错误拦截器（仅 axios 请求） |
 | `ui/src/ElevateStore.ts` | OIDC 提升流程的弹窗管理 |
 | `ui/src/user/Login.tsx` | OIDC 登录按钮 |
