@@ -525,28 +525,143 @@ write:   make(chan *model.MessageExternal, 1),
 | 场景 | 行为 | 影响 |
 |------|------|------|
 | 正常流速 | 消息写入 channel，立即被读取发送 | 无阻塞，实时推送 |
-| 客户端网络慢 | channel 满时，`c.write <- msg` 会阻塞 | 阻塞 `Notify` 调用，进而阻塞 HTTP 请求处理 |
+| 客户端网络慢 | channel 满时，`c.write <- msg` 会阻塞 | 阻塞当前 `Notify` 调用，进而阻塞对应的 HTTP 请求处理 |
 | 客户端已断开 | select 会检测到 write 错误，退出循环 | 连接关闭，从 clients map 中移除 |
+
+**并发语义澄清：RLock 不阻塞其他 Notify**
+
+```go
+// stream.go:82-91
+func (a *API) Notify(userID uint, msg *model.MessageExternal) {
+    a.lock.RLock()       // 读锁，允许多个 goroutine 同时持有
+    defer a.lock.RUnlock()
+    if clients, ok := a.clients[userID]; ok {
+        for _, c := range clients {
+            c.write <- msg  // 真正可能阻塞的地方
+        }
+    }
+}
+```
+
+**关键纠正**：`RLock` 是共享锁，**多个 Notify 可以并发持锁**，不会互相阻塞。真正的阻塞点是 `c.write <- msg` 这个 channel 写入操作。
 
 **慢连接对系统的影响链：**
 ```
 [新消息到达]
     ↓
-Notify() 尝试写入所有客户端的 write channel
+Notify() 获取 RLock（可并发）
     ↓
-某客户端网络慢 → channel 已满 → 阻塞
+遍历该 userID 下的所有客户端
     ↓
-Notify() 阻塞持有读锁
+某客户端网络慢 → channel 已满 → c.write <- msg 阻塞
     ↓
-其他消息的 Notify() 也被阻塞（等待读锁）
+当前 Notify() 被阻塞在 channel 写入上（仍持有 RLock）
     ↓
-整个推送系统被慢客户端拖慢
+其他 Notify() 可以正常获取 RLock 并处理其他用户的消息
+    ↓
+只有被阻塞的 Notify() 对应的 HTTP 请求超时
+    ↓
+其他用户的推送不受影响
 ```
 
 **设计权衡：**
 - 容量 1 意味着**最多缓冲 1 条消息**，保证消息的实时性
 - 牺牲了对慢客户端的容忍度，但避免了内存无限增长
 - 慢客户端会被自动断开（写入超时后连接关闭）
+- 影响范围是**单用户级**：某个用户的慢客户端只会阻塞该用户的 Notify，不影响其他用户
+
+### 5.5 c.write 关闭与并发发送风险
+
+#### 关闭路径分析
+
+`c.write` channel 的关闭有两条路径：
+
+```go
+// 路径 1：主动关闭（client.go:43-48）
+func (c *client) Close() {
+    c.once.Do(func() {
+        c.conn.Close()
+        close(c.write)  // 关闭 channel
+    })
+}
+
+// 路径 2：读写循环异常退出（client.go:50-57）
+func (c *client) NotifyClose() {
+    c.once.Do(func() {
+        c.conn.Close()
+        close(c.write)  // 关闭 channel
+        c.onClose(c)    // 从 clients map 中移除
+    })
+}
+```
+
+`NotifyClose` 被以下场景调用：
+- `startReading` defer：读取超时或客户端断开
+- `startWriteHandler` defer：写入超时或错误
+
+#### once 机制保护边界
+
+项目使用了一个自定义的 `once` 实现（once.go）：
+
+```go
+func (o *once) Do(f func()) {
+    if atomic.LoadUint32(&o.done) == 1 {
+        return  // 快速路径：已执行，直接返回
+    }
+    if o.mayExecute() {
+        f()  // 慢速路径：执行 f()
+    }
+}
+
+func (o *once) mayExecute() bool {
+    o.m.Lock()
+    defer o.m.Unlock()
+    if o.done == 0 {
+        atomic.StoreUint32(&o.done, 1)  // 先标记 done=1
+        return true                     // 再返回执行 f()
+    }
+    return false
+}
+```
+
+**关键特性**：`done` 标记在 `f()` 执行**之前**就被设置为 1。
+
+#### 并发发送与关闭的竞态窗口
+
+考虑以下时序：
+
+```
+Goroutine A (Notify 发送路径):
+  T1: a.lock.RLock()
+  T2: if atomic.LoadUint32(&c.once.done) == 0  // 还没关闭
+  T3: c.write <- msg                           // 准备写入
+
+Goroutine B (关闭路径):
+  T0: c.NotifyClose()
+  T1: atomic.LoadUint32(&o.done) == 0
+  T2: o.mayExecute() → 设置 done=1，返回 true
+  T3: close(c.write)                            // 关闭 channel
+```
+
+**竞态窗口**：
+- 如果 T3(A) 在 T3(B) **之前**完成：写入成功，无问题
+- 如果 T3(B) 在 T3(A) **之前**完成：`c.write <- msg` 会触发 **panic: send on closed channel**
+
+**once 无法覆盖这个窗口**：因为 `done` 标记只在 Do 入口检查，而 `c.write <- msg` 不在 Do 保护范围内。
+
+#### 风险等级与可观测后果
+
+| 风险场景 | 触发条件 | 后果 | 概率 |
+|---------|---------|------|------|
+| 写入已关闭的 channel | 关闭和发送在极短时间内并发 | panic: send on closed channel | 低（需精确时序命中）|
+| 读取已关闭的 channel | startWriteHandler 中 `<-c.write` | 返回 ok=false，正常退出循环 | 预期行为 |
+| 重复关闭 channel | 多次调用 Close/NotifyClose | once 保证只执行一次 close | 已保护 |
+
+**可观测后果**：
+- 服务端日志无特殊记录（panic 会被 Go runtime 捕获）
+- 该次消息推送失败，但不会影响其他客户端
+- 发送方的 HTTP 请求可能超时或收到 500 错误
+- 客户端重连后可以通过拉取 API 获取丢失的消息
 
 ### 5.5 消息写入 WebSocket
 
