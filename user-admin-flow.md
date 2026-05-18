@@ -136,6 +136,32 @@ func (a *Auth) checkClientElevated(client *model.Client) (authState, error) {
 }
 ```
 
+### 3.5 RequireElevatedClient 中间件执行顺序
+
+```go
+// auth/authentication.go:56-59
+// RequireElevatedClient requires an elevated client token or basic auth.
+func (a *Auth) RequireElevatedClient(ctx *gin.Context) {
+    a.evaluateOr401(ctx, a.handleUser(), a.handleClient(a.checkClientElevated))
+}
+```
+
+**执行顺序说明**：
+1. `evaluateOr401` 按顺序执行传入的 handler 函数列表
+2. **第一步**：执行 `handleUser()` - 尝试 Basic Auth 认证
+   - 如果请求携带有效的 Basic Auth 凭证，且用户名密码验证通过 → 直接返回 `authStateOk`，**跳过后续 Client Token 检查**
+   - 如果没有 Basic Auth 或验证失败 → 返回 `authStateSkip`，继续下一步
+3. **第二步**：执行 `handleClient(a.checkClientElevated)` - 尝试 Client Token 认证
+   - 读取 Client Token（Header/Cookie/Query）
+   - 查询数据库验证 Token 有效性
+   - 执行 `checkClientElevated` 检查提升状态
+4. 如果所有 handler 都返回 `authStateSkip` → 返回 401 Unauthorized
+
+**为什么 Basic Auth 会被放行？**
+- `handleUser()` 没有传递任何额外的 check 函数（对比 `RequireAdmin` 传递了 `checkUserAdmin`）
+- 只要 Basic Auth 验证通过（用户名密码正确），就直接返回 `authStateOk`
+- 设计意图：Basic Auth 本身就是用户主动提供密码的强认证方式，等同于已经完成了提升操作
+
 ---
 
 ## 四、路由与权限映射
@@ -451,6 +477,78 @@ func (a *UserAPI) ChangePassword(ctx *gin.Context) {
 }
 ```
 
+### 5.4.1 三种凭证路径鉴权详解
+
+`RequireElevatedClient` 中间件支持三种凭证类型，每种路径的鉴权逻辑和返回结果如下：
+
+#### 路径一：Basic Auth 凭证
+
+```
+请求头: Authorization: Basic dXNlcjE6cGFzc3dvcmQxMjM=
+```
+
+**鉴权流程**：
+1. `handleUser()` 检测到 Basic Auth 头
+2. 解析用户名和密码
+3. 查询数据库获取用户信息
+4. `password.ComparePassword()` 验证密码
+5. 验证通过 → 注册用户到 ctx，返回 `authStateOk`
+6. **跳过 Client Token 检查**，直接进入业务逻辑
+
+**状态码**：
+- 用户名密码正确 → **200 OK**（进入 ChangePassword 业务逻辑）
+- 用户名不存在或密码错误 → 返回 `authStateSkip`，继续尝试 Client Token 路径
+- 如果后续路径也失败 → **401 Unauthorized**
+
+#### 路径二：已提升的 Client Token（Elevated）
+
+```
+请求头: X-Gotify-Key: c1a2b3c4d5e6f7g8h9i0
+或 Cookie: gotify-client-token=c1a2b3c4d5e6f7g8h9i0
+```
+
+**前置条件**：该 Client 的 `ElevatedUntil` 字段不为空且未过期
+
+**鉴权流程**：
+1. Basic Auth 路径失败（无凭证或验证失败）→ 返回 `authStateSkip`
+2. `handleClient(a.checkClientElevated)` 读取 Token
+3. 查询数据库验证 Token 有效性
+4. `checkClientElevated()` 检查 `ElevatedUntil`
+5. 提升状态有效 → 注册 Client 到 ctx，返回 `authStateOk`
+6. 进入业务逻辑
+
+**状态码**：
+- Token 有效且已提升 → **200 OK**
+- Token 无效 → 返回 `authStateSkip`，继续下一 handler
+- 所有 handler 都 Skip → **401 Unauthorized**
+
+#### 路径三：未提升的 Client Token（Non-Elevated）
+
+**前置条件**：该 Client 的 `ElevatedUntil` 字段为空或已过期
+
+**鉴权流程**：
+1. Basic Auth 路径失败 → `authStateSkip`
+2. `handleClient(a.checkClientElevated)` 读取 Token
+3. Token 有效，但 `checkClientElevated()` 返回 `authStateNotElevated`
+4. `evaluate()` 函数检测到 `authStateNotElevated`
+5. 返回特定错误信息
+
+**状态码**：
+- **403 Forbidden**，错误信息：`"session not elevated, use basic auth or call /client:elevate"`
+
+### 5.4.2 鉴权结果汇总表
+
+| 凭证类型 | 条件 | 中间件状态 | HTTP 状态码 | 错误信息 |
+|---------|------|-----------|------------|----------|
+| **Basic Auth** | 用户名密码正确 | `authStateOk` | 200 OK | - |
+| **Basic Auth** | 用户名或密码错误 | `authStateSkip` | 401* | 无有效凭证 |
+| **Elevated Client Token** | Token 有效且已提升 | `authStateOk` | 200 OK | - |
+| **Elevated Client Token** | Token 无效 | `authStateSkip` | 401* | 无有效凭证 |
+| **Non-Elevated Client Token** | Token 有效但未提升 | `authStateNotElevated` | 403 Forbidden | session not elevated... |
+| **无凭证** | - | 全部 `authStateSkip` | 401 Unauthorized | you need to provide a valid access token... |
+
+*注：Basic Auth 失败或 Token 无效时，会继续尝试其他鉴权方式，只有所有方式都失败才返回 401
+
 **当前用户改密协作链路**：
 ```
 前端改密表单提交(pass)
@@ -458,9 +556,16 @@ func (a *UserAPI) ChangePassword(ctx *gin.Context) {
 POST /current/user/password
     ↓
 路由层: authentication.RequireElevatedClient
-    ├─ 校验会话是否处于提升状态
-    ├─ 未提升 → 403 session not elevated
-    └─ 已提升 → 继续执行
+    ├─ 执行顺序: handleUser() → handleClient(checkClientElevated)
+    │
+    ├─ 路径1: Basic Auth
+    │   ├─ 凭证正确 → authStateOk → 200 → 执行业务
+    │   └─ 凭证错误 → authStateSkip → 继续下一路径
+    │
+    └─ 路径2: Client Token
+        ├─ Token 无效 → authStateSkip → 401
+        ├─ Token 有效但未提升 → authStateNotElevated → 403
+        └─ Token 有效且已提升 → authStateOk → 200 → 执行业务
     ↓
 API层: ChangePassword
     ├─ 绑定 UserExternalPass DTO
@@ -831,6 +936,19 @@ UI 响应式更新（MobX observer）
 - 创建用户使用 `Optional` 而非 `RequireAdmin`，兼顾管理员操作和公开注册两种场景
 - 删除/更新用户使用 `RequireAdmin`，确保只有管理员可操作
 - 当前用户改密使用 `RequireElevatedClient`，防止会话劫持后恶意改密
+- `RequireElevatedClient` 采用"先 Basic Auth 后 Client Token"的执行顺序，Basic Auth 成功则短路跳过 Token 检查
+- Basic Auth 被视为等同于提升状态，因为用户主动提供密码本身就是强认证
 - 业务层与路由层鉴权相结合，实现灵活的权限控制策略
+
+**三类凭证路径总结**：
+| 凭证类型 | 鉴权结果 | HTTP状态码 | 适用场景 |
+|---------|---------|-----------|----------|
+| Basic Auth（正确） | 通过 | 200 | 用户主动输入密码的场景 |
+| Basic Auth（错误） | 跳过，继续 Token 检查 | 401* | 凭证无效 |
+| Elevated Client Token | 通过 | 200 | 会话已提升的 API 调用 |
+| Non-Elevated Client Token | 拒绝 | 403 | 会话未提升，需先调用 elevate 接口 |
+| 无有效凭证 | 拒绝 | 401 | 未认证请求 |
+
+*注：Basic Auth 失败后会继续尝试 Client Token，只有全部失败才返回 401
 
 整个链路从前端表单输入到后端数据库持久化，每一层都有明确的职责边界和安全校验，确保用户管理操作的安全性和可靠性。
