@@ -1,6 +1,6 @@
 # 后台管理员用户管理协作链路详解
 
-本文档深入解析 Gotify 后台管理员对普通用户执行创建、修改密码、删除等操作时，前端表单、后端鉴权校验、密码哈希、权限位字段之间的完整协作链路。
+本文档深入解析 Gotify 后台管理员对普通用户执行创建、修改密码、删除等操作时，前端表单、后端鉴权校验、密码哈希、权限位字段之间的完整协作链路。所有描述均严格对应代码实现。
 
 ---
 
@@ -101,12 +101,13 @@ const (
 )
 ```
 
-### 3.2 三级鉴权中间件
+### 3.2 四级鉴权中间件
 
 | 中间件 | 适用场景 | 校验逻辑 |
 |--------|----------|----------|
-| `RequireAdmin` | 用户管理接口 | 必须是管理员用户，支持 Basic Auth 或已提升的 Client Token |
-| `RequireElevatedClient` | 敏感操作（改密、删除） | 会话需处于提升状态（ElevatedUntil 未过期） |
+| `Optional` | 创建用户 | 尝试鉴权但不强制，支持匿名访问（配合业务层约束） |
+| `RequireAdmin` | 用户管理接口（查/改/删） | 必须是管理员用户，支持 Basic Auth 或已提升的 Client Token |
+| `RequireElevatedClient` | 当前用户改密 | 会话需处于提升状态（ElevatedUntil 未过期） |
 | `RequireClient` | 普通用户接口 | 仅需有效 Client Token 或 Basic Auth |
 
 ### 3.3 管理员校验实现
@@ -123,7 +124,7 @@ func (a *Auth) checkUserAdmin(user *model.User) (authState, error) {
 
 ### 3.4 会话提升机制（Elevation）
 
-敏感操作（用户管理、删除应用等）需要会话处于提升状态：
+敏感操作需要会话处于提升状态：
 
 ```go
 // auth/authentication.go:258-263
@@ -139,38 +140,51 @@ func (a *Auth) checkClientElevated(client *model.Client) (authState, error) {
 
 ## 四、路由与权限映射
 
-### 4.1 用户管理路由配置
+### 4.1 用户管理路由配置（代码原文）
 
 ```go
-// router/router.go:229-236
+// router/router.go:145,220-236
 
-// 创建用户 - 特殊处理：支持公开注册
+// 创建用户 - Optional 鉴权 + 业务层 registration 约束
 g.Group("/user").Use(authentication.Optional).POST("", userHandler.CreateUser)
 
-// 管理员专用路由组 - 全部需要 RequireAdmin
-authAdmin := g.Group("/user")
-authAdmin.Use(authentication.RequireAdmin)
+// 当前用户改密 - 需要提升权限
+clientElevated := g.Group("")
 {
+    clientElevated.Use(authentication.RequireElevatedClient)
+    clientElevated.POST("/current/user/password", userHandler.ChangePassword)
+}
+
+// 管理员专用路由组 - 查/改/删全部需要 RequireAdmin
+authAdmin := g.Group("/user")
+{
+    authAdmin.Use(authentication.RequireAdmin)
     authAdmin.GET("", userHandler.GetUsers)          // 用户列表
     authAdmin.DELETE("/:id", userHandler.DeleteUserByID)  // 删除用户
     authAdmin.GET("/:id", userHandler.GetUserByID)   // 用户详情
     authAdmin.POST("/:id", userHandler.UpdateUserByID)    // 更新用户
 }
-
-// 当前用户改密 - 需要提升权限
-clientElevated.POST("/current/user/password", userHandler.ChangePassword)
 ```
 
-### 4.2 权限控制矩阵
+### 4.2 四类操作鉴权判定表
 
-| 操作 | 路由 | HTTP方法 | 所需权限 | 鉴权方式 |
-|------|------|----------|----------|----------|
-| 创建用户 | `/user` | POST | 管理员 或 注册开放 | Optional |
-| 用户列表 | `/user` | GET | 管理员 | RequireAdmin |
-| 用户详情 | `/user/:id` | GET | 管理员 | RequireAdmin |
-| 更新用户 | `/user/:id` | POST | 管理员 | RequireAdmin |
-| 删除用户 | `/user/:id` | DELETE | 管理员 | RequireAdmin |
-| 修改自己密码 | `/current/user/password` | POST | 登录用户+会话提升 | RequireElevatedClient |
+| 操作类型 | 路由 | HTTP方法 | 路由层中间件 | 业务层额外约束 | 判定逻辑 |
+|---------|------|----------|-------------|---------------|----------|
+| **创建用户** | `/user` | POST | `Optional` | Registration 开关 + 管理员身份判断 | 1. 有凭证且是管理员 → 允许创建任意用户<br>2. 有凭证但非管理员 → 需 Registration 开启且不创建管理员<br>3. 无凭证（匿名） → 需 Registration 开启且不创建管理员 |
+| **更新用户** | `/user/:id` | POST | `RequireAdmin` | 不能取消最后一个管理员 | 1. 必须是管理员用户<br>2. 若取消原管理员身份，需确保不是最后一个管理员 |
+| **删除用户** | `/user/:id` | DELETE | `RequireAdmin` | 不能删除最后一个管理员 | 1. 必须是管理员用户<br>2. 若删除的是管理员，需确保不是最后一个管理员 |
+| **当前用户改密** | `/current/user/password` | POST | `RequireElevatedClient` | 无 | 1. 必须是已登录用户<br>2. 会话必须处于提升状态（ElevatedUntil 未过期） |
+
+### 4.3 权限控制矩阵（完整）
+
+| 操作 | 路由 | HTTP方法 | 所需权限 | 鉴权方式 | 代码位置 |
+|------|------|----------|----------|----------|----------|
+| 创建用户 | `/user` | POST | 管理员 或 注册开放 | Optional | router.go:145 |
+| 用户列表 | `/user` | GET | 管理员 | RequireAdmin | router.go:232 |
+| 用户详情 | `/user/:id` | GET | 管理员 | RequireAdmin | router.go:234 |
+| 更新用户 | `/user/:id` | POST | 管理员 | RequireAdmin | router.go:235 |
+| 删除用户 | `/user/:id` | DELETE | 管理员 | RequireAdmin | router.go:233 |
+| 修改自己密码 | `/current/user/password` | POST | 登录用户+会话提升 | RequireElevatedClient | router.go:226 |
 
 ---
 
@@ -191,34 +205,53 @@ func (a *UserAPI) CreateUser(ctx *gin.Context) {
         }
 
         // 2. 检查用户名是否已存在
-        existingUser, _ := a.DB.GetUserByName(internal.Name)
-
-        // 3. 权限校验
-        var requestedBy *model.User
-        uid := auth.TryGetUserID(ctx)
-        if uid != nil {
-            requestedBy, _ = a.DB.GetUserByID(*uid)
+        existingUser, err := a.DB.GetUserByName(internal.Name)
+        if success := successOrAbort(ctx, 500, err); !success {
+            return
         }
 
-        if requestedBy == nil || !requestedBy.Admin {
-            // 非管理员调用
-            if !a.Registration {
-                ctx.AbortWithError(401/403, "you are not allowed")
+        // 3. 权限校验 - Optional 鉴权后业务层二次判断
+        var requestedBy *model.User
+        uid := auth.TryGetUserID(ctx) // 从 Optional 鉴权结果中获取用户ID
+        if uid != nil {
+            requestedBy, err = a.DB.GetUserByID(*uid)
+            if err != nil {
+                ctx.AbortWithError(http.StatusInternalServerError, fmt.Errorf("could not get user: %s", err))
                 return
             }
+        }
+
+        // 核心判定逻辑
+        if requestedBy == nil || !requestedBy.Admin {
+            // 非管理员调用场景
+            status := http.StatusUnauthorized
+            if requestedBy != nil {
+                status = http.StatusForbidden
+            }
+            // 约束1: 注册开关必须开启
+            if !a.Registration {
+                ctx.AbortWithError(status, errors.New("you are not allowed to access this api"))
+                return
+            }
+            // 约束2: 不能创建管理员用户
             if internal.Admin {
-                ctx.AbortWithError(401/403, "cannot create admin user")
+                ctx.AbortWithError(status, errors.New("you are not allowed to create an admin user"))
                 return
             }
         }
 
         // 4. 持久化
         if existingUser == nil {
-            a.DB.CreateUser(internal)
-            a.UserChangeNotifier.fireUserAdded(internal.ID) // 触发插件初始化等
+            if success := successOrAbort(ctx, 500, a.DB.CreateUser(internal)); !success {
+                return
+            }
+            if err := a.UserChangeNotifier.fireUserAdded(internal.ID); err != nil {
+                ctx.AbortWithError(500, err)
+                return
+            }
             ctx.JSON(200, toExternalUser(internal))
         } else {
-            ctx.AbortWithError(400, "username already exists")
+            ctx.AbortWithError(400, errors.New("username already exists"))
         }
     }
 }
@@ -230,12 +263,21 @@ func (a *UserAPI) CreateUser(ctx *gin.Context) {
     ↓
 UserStore.create() → POST /user
     ↓
+路由层: authentication.Optional
+    ├─ 有有效凭证 → 识别用户身份，注册到 ctx
+    └─ 无有效凭证 → ctx 中无用户信息，继续执行
+    ↓
 API层: CreateUser
     ├─ 密码哈希 (bcrypt)
     ├─ 检查用户名唯一性
-    ├─ 权限校验:
-    │   ├─ 管理员调用 → 允许创建任意用户
-    │   └─ 非管理员调用 → 仅当注册开放且不创建管理员时允许
+    ├─ 业务层权限判定:
+    │   ├─ 是管理员 → 允许创建任意用户
+    │   ├─ 非管理员/匿名 → 检查 Registration 开关
+    │   │   ├─ Registration=false → 拒绝 401/403
+    │   │   └─ Registration=true → 检查是否创建管理员
+    │   │       ├─ 创建管理员 → 拒绝 401/403
+    │   │       └─ 创建普通用户 → 允许
+    │   └─ 其他情况 → 拒绝
     ├─ 数据库写入
     └─ 触发 UserAdded 事件 → 插件初始化
     ↓
@@ -252,29 +294,41 @@ func (a *UserAPI) UpdateUserByID(ctx *gin.Context) {
     withID(ctx, "id", func(id uint) {
         var user *model.UpdateUserExternal
         if err := ctx.Bind(&user); err == nil {
-            oldUser, _ := a.DB.GetUserByID(id)
-            
-            // 安全校验：不能取消最后一个管理员
-            adminCount, _ := a.DB.CountUser(&model.User{Admin: true})
-            if !user.Admin && oldUser.Admin && adminCount == 1 {
-                ctx.AbortWithError(400, "cannot delete last admin")
+            oldUser, err := a.DB.GetUserByID(id)
+            if success := successOrAbort(ctx, 500, err); !success {
                 return
             }
+            if oldUser != nil {
+                // 安全校验：不能取消最后一个管理员
+                adminCount, err := a.DB.CountUser(&model.User{Admin: true})
+                if success := successOrAbort(ctx, 500, err); !success {
+                    return
+                }
+                // 判定：原用户是管理员，且要取消管理员，且是最后一个管理员
+                if !user.Admin && oldUser.Admin && adminCount == 1 {
+                    ctx.AbortWithError(400, errors.New("cannot delete last admin"))
+                    return
+                }
 
-            internal := &model.User{
-                ID:    oldUser.ID,
-                Name:  user.Name,
-                Admin: user.Admin,
-                Pass:  oldUser.Pass, // 默认保留原密码
-            }
-            
-            // 仅当密码字段非空时重新哈希
-            if user.Pass != "" {
-                internal.Pass = password.CreatePassword(user.Pass, a.PasswordStrength)
-            }
+                internal := &model.User{
+                    ID:    oldUser.ID,
+                    Name:  user.Name,
+                    Admin: user.Admin,
+                    Pass:  oldUser.Pass, // 默认保留原密码
+                }
+                
+                // 仅当密码字段非空时重新哈希
+                if user.Pass != "" {
+                    internal.Pass = password.CreatePassword(user.Pass, a.PasswordStrength)
+                }
 
-            a.DB.UpdateUser(internal)
-            ctx.JSON(200, toExternalUser(internal))
+                if success := successOrAbort(ctx, 500, a.DB.UpdateUser(internal)); !success {
+                    return
+                }
+                ctx.JSON(200, toExternalUser(internal))
+            } else {
+                ctx.AbortWithError(404, errors.New("user does not exist"))
+            }
         }
     })
 }
@@ -285,6 +339,11 @@ func (a *UserAPI) UpdateUserByID(ctx *gin.Context) {
 前端编辑表单提交(name, pass?, admin)
     ↓
 UserStore.update(id, name, pass, admin) → POST /user/:id
+    ↓
+路由层: authentication.RequireAdmin
+    ├─ 校验是否是管理员用户
+    ├─ 非管理员 → 403 Forbidden
+    └─ 是管理员 → 继续执行
     ↓
 API层: UpdateUserByID
     ├─ 绑定 UpdateUserExternal DTO
@@ -305,18 +364,30 @@ UserStore.refresh() → 刷新用户列表
 // api/user.go:329-353
 func (a *UserAPI) DeleteUserByID(ctx *gin.Context) {
     withID(ctx, "id", func(id uint) {
-        user, _ := a.DB.GetUserByID(id)
+        user, err := a.DB.GetUserByID(id)
+        if success := successOrAbort(ctx, 500, err); !success {
+            return
+        }
         if user != nil {
             // 安全校验：不能删除最后一个管理员
-            adminCount, _ := a.DB.CountUser(&model.User{Admin: true})
+            adminCount, err := a.DB.CountUser(&model.User{Admin: true})
+            if success := successOrAbort(ctx, 500, err); !success {
+                return
+            }
+            // 判定：要删除的用户是管理员，且是最后一个管理员
             if user.Admin && adminCount == 1 {
-                ctx.AbortWithError(400, "cannot delete last admin")
+                ctx.AbortWithError(400, errors.New("cannot delete last admin"))
                 return
             }
             
             // 触发删除事件（清理WebSocket连接、插件资源等）
-            a.UserChangeNotifier.fireUserDeleted(id)
-            a.DB.DeleteUserByID(id)
+            if err := a.UserChangeNotifier.fireUserDeleted(id); err != nil {
+                ctx.AbortWithError(500, err)
+                return
+            }
+            successOrAbort(ctx, 500, a.DB.DeleteUserByID(id))
+        } else {
+            ctx.AbortWithError(404, errors.New("user does not exist"))
         }
     })
 }
@@ -343,6 +414,11 @@ func (d *GormDatabase) DeleteUserByID(id uint) error {
     ↓
 UserStore.remove(id) → DELETE /user/:id
     ↓
+路由层: authentication.RequireAdmin
+    ├─ 校验是否是管理员用户
+    ├─ 非管理员 → 403 Forbidden
+    └─ 是管理员 → 继续执行
+    ↓
 API层: DeleteUserByID
     ├─ 查询用户是否存在
     ├─ 安全校验: 不能删除最后一个管理员
@@ -356,6 +432,42 @@ API层: DeleteUserByID
         └─ 删除 User 记录
     ↓
 UserStore.refresh() → 刷新用户列表
+```
+
+### 5.4 当前用户改密流程
+
+```go
+// api/user.go:388-398
+func (a *UserAPI) ChangePassword(ctx *gin.Context) {
+    pw := model.UserExternalPass{}
+    if err := ctx.Bind(&pw); err == nil {
+        user, err := a.DB.GetUserByID(auth.GetUserID(ctx))
+        if success := successOrAbort(ctx, 500, err); !success {
+            return
+        }
+        user.Pass = password.CreatePassword(pw.Pass, a.PasswordStrength)
+        successOrAbort(ctx, 500, a.DB.UpdateUser(user))
+    }
+}
+```
+
+**当前用户改密协作链路**：
+```
+前端改密表单提交(pass)
+    ↓
+POST /current/user/password
+    ↓
+路由层: authentication.RequireElevatedClient
+    ├─ 校验会话是否处于提升状态
+    ├─ 未提升 → 403 session not elevated
+    └─ 已提升 → 继续执行
+    ↓
+API层: ChangePassword
+    ├─ 绑定 UserExternalPass DTO
+    ├─ 获取当前用户ID（从鉴权上下文）
+    ├─ 查询用户信息
+    ├─ password.CreatePassword() → bcrypt 哈希
+    └─ 数据库更新用户密码
 ```
 
 ---
@@ -511,28 +623,33 @@ const Users = observer(() => {
 └─────────────────────────────────────────────────────────────┘
                               ↓ HTTP 请求
 ┌─────────────────────────────────────────────────────────────┐
-│                     后端 API 层                             │
+│                     路由 & 鉴权层                            │
 ├─────────────────────────────────────────────────────────────┤
 │  5. Router: POST /user → authentication.Optional            │
-│     ↓ 鉴权中间件                                            │
-│  6. Auth: Optional 鉴权                                      │
-│     ├─ 有有效凭证 → 识别用户身份                             │
-│     └─ 无有效凭证 → 匿名访问（仅当注册开放时允许）            │
-│     ↓                                                       │
-│  7. UserAPI.CreateUser()                                     │
+│     ├─ 有有效凭证 → 识别用户身份，注册到 ctx                  │
+│     └─ 无有效凭证 → ctx 中无用户信息，继续执行                │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                     业务 API 层                              │
+├─────────────────────────────────────────────────────────────┤
+│  6. UserAPI.CreateUser()                                     │
 │     ├─ 绑定 CreateUserExternal DTO                          │
 │     ├─ password.CreatePassword() → bcrypt 哈希               │
 │     ├─ 检查用户名唯一性                                      │
-│     ├─ 权限校验:                                            │
-│     │  ├─ 管理员 → 允许创建任意用户                          │
-│     │  └─ 非管理员/匿名 → 仅当注册开放且非管理员用户          │
+│     ├─ 业务层权限判定:                                       │
+│     │  ├─ auth.TryGetUserID() 获取调用者身份                  │
+│     │  ├─ 是管理员 → 允许创建任意用户                         │
+│     │  └─ 非管理员/匿名 → 检查 Registration                  │
+│     │     ├─ Registration=false → 401/403 拒绝              │
+│     │     └─ Registration=true → 不能创建管理员              │
 │     ├─ DB.CreateUser() → 写入数据库                          │
 │     └─ fireUserAdded() → 触发插件初始化                      │
 │     ↓ 返回 UserExternal                                     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 修改用户密码完整链路
+### 7.2 更新用户（含改密）完整链路
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -549,15 +666,18 @@ const Users = observer(() => {
 └─────────────────────────────────────────────────────────────┘
                               ↓ HTTP 请求
 ┌─────────────────────────────────────────────────────────────┐
-│                     后端 API 层                             │
+│                     路由 & 鉴权层                            │
 ├─────────────────────────────────────────────────────────────┤
 │  5. Router: POST /user/:id → authentication.RequireAdmin    │
-│     ↓ 鉴权中间件                                            │
-│  6. Auth: RequireAdmin 校验                                  │
 │     ├─ 检查是否是管理员用户（Admin=true）                     │
-│     └─ 支持 Basic Auth 或已提升的 Client Token               │
-│     ↓                                                       │
-│  7. UserAPI.UpdateUserByID()                                 │
+│     ├─ 非管理员 → 403 Forbidden                             │
+│     └─ 是管理员 → 继续执行                                   │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                     业务 API 层                              │
+├─────────────────────────────────────────────────────────────┤
+│  6. UserAPI.UpdateUserByID()                                 │
 │     ├─ 绑定 UpdateUserExternal DTO                          │
 │     ├─ 查询原用户信息                                        │
 │     ├─ 安全校验: 不能取消最后一个管理员                       │
@@ -585,13 +705,18 @@ const Users = observer(() => {
 └─────────────────────────────────────────────────────────────┘
                               ↓ HTTP 请求
 ┌─────────────────────────────────────────────────────────────┐
-│                     后端 API 层                             │
+│                     路由 & 鉴权层                            │
 ├─────────────────────────────────────────────────────────────┤
 │  5. Router: DELETE /user/:id → authentication.RequireAdmin   │
-│     ↓ 鉴权中间件                                            │
-│  6. Auth: RequireAdmin 校验                                  │
-│     ↓                                                       │
-│  7. UserAPI.DeleteUserByID()                                 │
+│     ├─ 检查是否是管理员用户（Admin=true）                     │
+│     ├─ 非管理员 → 403 Forbidden                             │
+│     └─ 是管理员 → 继续执行                                   │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                     业务 API 层                              │
+├─────────────────────────────────────────────────────────────┤
+│  6. UserAPI.DeleteUserByID()                                 │
 │     ├─ 查询用户是否存在                                      │
 │     ├─ 安全校验: 不能删除最后一个管理员                       │
 │     ├─ fireUserDeleted(id):                                 │
@@ -602,6 +727,39 @@ const Users = observer(() => {
 │        ├─ 级联删除 Clients                                  │
 │        ├─ 级联删除 PluginConfs                              │
 │        └─ 删除 User 记录                                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 7.4 当前用户改密完整链路
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     前端 UI 层                              │
+├─────────────────────────────────────────────────────────────┤
+│  1. 用户设置页面: 输入新密码，点击确认                         │
+│     ↓                                                       │
+│  2. POST /current/user/password {pass}                       │
+└─────────────────────────────────────────────────────────────┘
+                              ↓ HTTP 请求
+┌─────────────────────────────────────────────────────────────┐
+│                     路由 & 鉴权层                            │
+├─────────────────────────────────────────────────────────────┤
+│  3. Router: POST /current/user/password                     │
+│     → authentication.RequireElevatedClient                  │
+│     ├─ 检查会话提升状态（ElevatedUntil）                     │
+│     ├─ 未提升 → 403 session not elevated                    │
+│     └─ 已提升 → 继续执行                                     │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                     业务 API 层                              │
+├─────────────────────────────────────────────────────────────┤
+│  4. UserAPI.ChangePassword()                                 │
+│     ├─ 绑定 UserExternalPass DTO                            │
+│     ├─ auth.GetUserID(ctx) 获取当前用户                       │
+│     ├─ 查询用户信息                                          │
+│     ├─ password.CreatePassword() → bcrypt 哈希               │
+│     └─ DB.UpdateUser() → 更新数据库                          │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -620,15 +778,20 @@ const Users = observer(() => {
 - 哈希强度可配置，随硬件提升可调整
 - 更新用户时空密码字段保留原哈希，避免泄露
 
-### 8.3 会话提升机制
+### 8.3 鉴权分层设计
+- **路由层**：统一中间件拦截，`Optional`/`RequireAdmin`/`RequireElevatedClient` 三级拦截
+- **业务层**：创建用户接口二次校验，结合 `Registration` 配置实现灵活的注册策略
+- **数据层**：更新/删除操作的最后管理员保护，防止系统不可用
+
+### 8.4 会话提升机制
 - 敏感操作需要 Elevated 会话
 - 提升状态有过期时间（ElevatedUntil）
 - 支持 Basic Auth 直接获得提升权限
 - OIDC 用户通过弹窗流程获得提升
 
-### 8.4 API 权限控制
-- 用户管理接口统一使用 `RequireAdmin` 中间件
-- 创建用户接口特殊处理以支持公开注册
+### 8.5 API 权限控制
+- 用户管理接口（查/改/删）统一使用 `RequireAdmin` 中间件
+- 创建用户接口特殊处理：`Optional` + 业务层 `Registration` 约束
 - 非管理员无法创建管理员用户
 - 所有操作返回结构化错误信息
 
@@ -659,8 +822,15 @@ UI 响应式更新（MobX observer）
 
 1. **分层清晰**：Model → DTO → API → Router → Middleware → Frontend Store → UI Component
 2. **安全优先**：密码哈希、权限校验、会话提升、级联清理
-3. **状态一致性**：操作后自动刷新列表，MobX 响应式更新 UI
-4. **容错设计**：最后管理员保护、用户名唯一性校验、空密码字段处理
-5. **可扩展性**：UserChangeNotifier 事件机制支持插件扩展
+3. **鉴权分层**：路由层中间件 + 业务层二次校验，确保权限控制万无一失
+4. **状态一致性**：操作后自动刷新列表，MobX 响应式更新 UI
+5. **容错设计**：最后管理员保护、用户名唯一性校验、空密码字段处理
+6. **可扩展性**：UserChangeNotifier 事件机制支持插件扩展
+
+**鉴权设计亮点**：
+- 创建用户使用 `Optional` 而非 `RequireAdmin`，兼顾管理员操作和公开注册两种场景
+- 删除/更新用户使用 `RequireAdmin`，确保只有管理员可操作
+- 当前用户改密使用 `RequireElevatedClient`，防止会话劫持后恶意改密
+- 业务层与路由层鉴权相结合，实现灵活的权限控制策略
 
 整个链路从前端表单输入到后端数据库持久化，每一层都有明确的职责边界和安全校验，确保用户管理操作的安全性和可靠性。
