@@ -1,0 +1,222 @@
+# 健康检查与版本信息接口整体图景
+
+## 一、接口概览
+
+| 接口 | 路径 | 方法 | 鉴权要求 | 定义位置 |
+|------|------|------|----------|----------|
+| 健康检查 | `/health` | GET/HEAD | 无需鉴权 | `router/router.go:119` |
+| 版本信息 | `/version` | GET | 无需鉴权 | `router/router.go:162-164` |
+
+---
+
+## 二、健康检查接口 (`/health`)
+
+### 2.1 核心实现
+
+**处理函数** (`api/health.go:34-46`):
+
+```go
+func (a *HealthAPI) Health(ctx *gin.Context) {
+    if err := a.DB.Ping(); err != nil {
+        ctx.JSON(500, model.Health{
+            Health:   model.StatusOrange,
+            Database: model.StatusRed,
+        })
+        return
+    }
+    ctx.JSON(200, model.Health{
+        Health:   model.StatusGreen,
+        Database: model.StatusGreen,
+    })
+}
+```
+
+### 2.2 读取的进程内状态
+
+健康检查接口**不读取进程内状态**，仅通过数据库 Ping 操作判断外部依赖的可用性。
+
+### 2.3 依赖的底层组件
+
+```
+HealthAPI
+    └── HealthDatabase (接口)
+            └── GormDatabase (database/ping.go:4-9)
+                    └── *gorm.DB
+                            └── sql.DB.Ping()
+```
+
+- **`database/ping.go:4-9`**: 调用底层 `sql.DB.Ping()` 验证数据库连接
+- 检查点：数据库连接池是否可用、网络是否通畅
+
+### 2.4 状态模型 (`model/health.go`)
+
+```go
+type Health struct {
+    Health   string `json:"health"`   // 整体健康状态
+    Database string `json:"database"` // 数据库健康状态
+}
+```
+
+**状态等级**:
+- `green`: 正常
+- `orange`: 部分异常（数据库异常时整体状态）
+- `red`: 严重异常
+
+### 2.5 与系统启动顺序的关联
+
+**启动流程** (`app.go:26-54`):
+
+```
+1. 初始化版本信息
+2. 加载配置
+3. 创建目录
+4. 初始化数据库连接 (database.New) ←── 必须成功
+5. 创建路由 (router.Create)
+    ├── 注册 /health 路由 (router.go:119)
+    └── 注入 DB 实例到 HealthAPI
+6. 启动服务器 (runner.Run)
+```
+
+- `/health` 接口在**数据库初始化完成后**才会注册
+- 服务器启动后即可调用，但数据库连接失败会在步骤 4 `panic`
+
+### 2.6 鉴权分析
+
+- **无需鉴权**：路由注册在认证中间件之前 (`router/router.go:119` 位于 `authentication.Require*` 之前)
+- 访问方式：匿名访问
+- 日志优化：本地健康检查请求不记录日志 (`router/router.go:243-244`)
+
+---
+
+## 三、版本信息接口 (`/version`)
+
+### 3.1 核心实现
+
+**处理函数** (`router/router.go:162-164`):
+
+```go
+g.GET("version", func(ctx *gin.Context) {
+    ctx.JSON(200, vInfo)
+})
+```
+
+### 3.2 读取的进程内状态
+
+版本信息在**编译时注入**，进程启动后为只读状态：
+
+```go
+// app.go:15-24
+var (
+    Version   = "unknown"   // 版本号
+    Commit    = "unknown"   // Git Commit Hash
+    BuildDate = "unknown"   // 构建时间
+    Mode      = mode.Dev    // 构建模式
+)
+```
+
+### 3.3 依赖的底层组件
+
+```
+VersionInfo (model/version.go)
+    ├── Version string   ← 编译时注入
+    ├── Commit string    ← 编译时注入
+    └── BuildDate string ← 编译时注入
+```
+
+- **无运行时依赖**：不依赖数据库、网络或任何外部组件
+- 数据来源：编译时通过 `-ldflags` 注入
+
+### 3.4 与系统启动顺序的关联
+
+**启动流程** (`app.go:26-54`):
+
+```
+1. 初始化版本信息 ←── 最早执行，编译期已确定
+    vInfo := &model.VersionInfo{
+        Version: Version,
+        Commit: Commit,
+        BuildDate: BuildDate
+    }
+2. 加载配置
+3. 创建目录
+4. 初始化数据库连接
+5. 创建路由 (router.Create)
+    └── 注册 /version 路由 (router.go:162)
+        └── 注入 vInfo 指针
+6. 启动服务器
+```
+
+- `/version` 接口返回的数据在**程序启动第一时间**就已确定
+- 即使数据库初始化失败（步骤 4 panic），版本信息本身依然有效
+
+### 3.5 鉴权分析
+
+- **无需鉴权**：路由注册在认证中间件之前 (`router/router.go:162` 位于 `authentication.Require*` 之前)
+- 访问方式：匿名访问
+
+---
+
+## 四、两类接口运维场景差异定位
+
+| 维度 | 健康检查 (`/health`) | 版本信息 (`/version`) |
+|------|---------------------|----------------------|
+| **核心用途** | 探测服务**运行时可用性** | 标识服务**静态版本属性** |
+| **调用频率** | 高频（负载均衡、K8s liveness/readiness 探针，通常 1-10s/次） | 低频（部署验证、问题排查、版本追溯） |
+| **返回值变化** | 动态变化（随服务状态变化） | 静态不变（进程生命周期内恒定） |
+| **失败影响** | 失败意味着服务不可用，触发告警/摘除 | 几乎不会失败（除非进程完全崩溃） |
+| **依赖组件** | 数据库连接 | 无（编译时数据） |
+| **性能开销** | 有（数据库 Ping 操作） | 极低（直接返回内存对象） |
+| **适用场景** | - 负载均衡健康检查<br>- Kubernetes 存活/就绪探针<br>- 监控告警 | - 部署后版本验证<br>- 故障时版本追溯<br>- 自动化部署流水线校验 |
+| **启动时机** | 数据库就绪后可用 | 进程启动即可用 |
+
+---
+
+## 五、路由注册顺序与鉴权边界
+
+```
+router/router.go 路由注册顺序:
+
+1. 全局中间件 (Logger, Recovery, CORS 等)
+2. /health ←────────── 公开，无鉴权
+3. /swagger
+4. /image
+5. /docs
+6. JSON Header 中间件
+7. CORS 中间件
+8. /plugin (需要 RequireClient)
+9. /user (部分公开)
+10. /auth/local/login
+11. /version ←──────── 公开，无鉴权
+12. /gotifyinfo ←───── 公开，无鉴权
+13. /message (需要 RequireApplicationToken)
+14. ... 其他需要鉴权的接口
+```
+
+**关键观察**:
+- `/health` 和 `/version` 均注册在**认证中间件链之前**
+- 这是运维接口的标准设计：确保即使认证系统出现问题，运维人员仍能获取基础状态信息
+
+---
+
+## 六、架构设计思考
+
+### 6.1 健康检查的局限性
+
+当前实现仅检查**数据库连接**，未覆盖：
+- 插件系统状态
+- 消息队列积压
+- 流式连接（WebSocket）健康度
+- 磁盘空间
+
+### 6.2 版本信息的设计优点
+
+- **编译时注入**：无需读取外部文件，性能最优
+- **不可变性**：进程生命周期内不变化，可安全缓存
+- **完整标识**：Version + Commit + BuildDate 三元组唯一标识构建产物
+
+### 6.3 运维友好性设计
+
+1. **无鉴权**：便于监控系统集成
+2. **标准 HTTP 状态码**：200 = 健康，500 = 不健康
+3. **结构化 JSON 响应**：便于自动化解析
+4. **本地日志静默**：`127.0.0.1` 的健康检查请求不打日志，避免日志泛滥 (`router/router.go:243-244`)
