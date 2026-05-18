@@ -2,7 +2,7 @@
 
 ## 概述
 
-本文档详细分析了从管理界面点击"Push Message"按钮发送测试消息，到消息通过 WebSocket 实时推送到前端的完整技术链路。
+本文档详细分析了从管理界面点击"Push Message"按钮发送测试消息，到消息通过 WebSocket 实时推送到前端的完整技术链路。包含主路径分析、安全机制、失败路径处理和背压语义说明。
 
 ---
 
@@ -175,6 +175,58 @@ func (a *Auth) handleApplication(ctx *gin.Context) (authState, error) {
 | Client Token | ❌ 不可以 | 客户端用于接收消息 |
 | User Basic Auth | ❌ 不可以 | 用户用于管理操作 |
 
+### 2.5 发送链路与接收链路的双认证体系
+
+**核心设计：发送和接收使用两套独立的认证体系，通过 `UserID` 汇合。**
+
+#### 发送链路（/message POST）
+```
+POST /message → RequireApplicationToken 中间件
+    ↓
+使用 Application Token 认证
+    ↓
+认证成功后，Application.UserID 标识消息归属用户
+    ↓
+消息写入数据库时关联 ApplicationID（间接关联 UserID）
+```
+
+#### 接收链路（/stream WebSocket）
+```
+GET /stream → RequireClient 中间件
+    ↓
+使用 Client Token 认证
+    ↓
+认证成功后，Client.UserID 标识接收者
+    ↓
+WebSocket 客户端按 UserID 分组存储在 stream.API.clients 中
+```
+
+#### 汇合点：通过 UserID 关联推送目标
+
+```go
+// Application 模型（model/application.go:23）
+UserID uint   `gorm:"index;..." json:"-"`  // 应用所属用户
+
+// Client 模型
+UserID uint   // 客户端所属用户
+
+// 推送时（api/message.go:382）
+a.Notifier.Notify(auth.GetUserID(ctx), toExternalMessage(msgInternal))
+// 这里的 UserID 来自 Application.UserID
+
+// 分发时（api/stream/stream.go:92-99）
+if clients, ok := a.clients[userID]; ok {
+    for _, c := range clients {
+        c.write <- msg  // 推送给该 UserID 下所有 Client 连接
+    }
+}
+```
+
+**设计意图：**
+- **隔离**：发送方（应用）和接收方（客户端）使用不同 token，防止权限混淆
+- **关联**：通过 UserID 将发送和接收关联到同一用户，确保只有消息所属用户能收到
+- **灵活**：一个用户可以有多个应用发送、多个客户端接收，全部通过 UserID 汇聚
+
 ---
 
 ## 第三部分：后端消息处理与写入
@@ -210,15 +262,37 @@ func (a *MessageAPI) CreateMessage(ctx *gin.Context) {
 
 **处理步骤：**
 1. 绑定请求体到 `MessageExternal` 结构体
-2. 从认证上下文中获取应用信息，设置 `ApplicationID`
+2. 从认证上下文中获取应用信息，**强制覆盖** `ApplicationID`
 3. **标题兜底：** 如果标题为空，使用应用名称
 4. **优先级兜底：** 如果未设置优先级，使用应用默认优先级
 5. 设置当前时间为消息日期
-6. 转换为内部模型 `Message` 并持久化到数据库
-7. 通过 `Notifier` 通知所有已连接的客户端（WebSocket 推送）
-8. 返回创建成功的消息
+6. **强制重置** `ID = 0`，由数据库自增生成
+7. 转换为内部模型 `Message` 并持久化到数据库
+8. 通过 `Notifier` 通知所有已连接的客户端（WebSocket 推送）
+9. 返回创建成功的消息
 
-### 3.2 模型转换
+### 3.2 防伪造保护机制
+
+CreateMessage 中有两处关键的防伪造保护：
+
+```go
+// 保护 1：强制覆盖 ApplicationID，忽略请求体中的 appid
+message.ApplicationID = application.ID
+
+// 保护 2：强制重置 ID，防止客户端指定
+message.ID = 0
+```
+
+**安全含义详解：**
+
+| 保护措施 | 防止的攻击 | 安全意义 |
+|---------|-----------|---------|
+| `ApplicationID = application.ID` | 越权发送：恶意用户在请求体中传入其他应用的 appid，试图伪造其他应用发送消息 | 确保消息的 ApplicationID 只能来自认证上下文，即只能用当前 token 对应的应用发送 |
+| `ID = 0` | ID 注入：恶意用户指定一个已存在的 ID，可能导致覆盖或冲突；或指定一个未来的 ID 破坏自增序列 | 确保 ID 始终由数据库自增生成，维护数据一致性 |
+
+> **重要**：虽然 `MessageExternal` 结构体定义了 `ID` 和 `ApplicationID` 字段（用于返回响应），但在创建消息时这两个字段会被强制覆盖，客户端传入的值完全被忽略。
+
+### 3.3 模型转换
 
 **外部模型（API 交互）：**
 ```go
@@ -252,7 +326,7 @@ type Message struct {
 - `toInternalMessage`: 外部 → 内部，`Extras` 序列化为 JSON 字节
 - `toExternalMessage`: 内部 → 外部，`Extras` 反序列化为 map
 
-### 3.3 数据库持久化 - database/message.go
+### 3.4 数据库持久化 - database/message.go
 
 ```go
 // database/message.go:21-24
@@ -265,9 +339,116 @@ func (d *GormDatabase) CreateMessage(message *model.Message) error {
 
 ---
 
-## 第四部分：WebSocket 实时推送
+## 第四部分：失败路径与状态语义
 
-### 4.1 Notifier 接口
+### 4.1 认证失败路径
+
+#### 场景 1：Token 缺失
+- **触发条件**：请求中没有携带任何 token（没有 X-Gotify-Key 头、没有 token query 参数等）
+- **处理流程**：`handleApplication` 返回 `authStateSkip` → `handleUser` 也返回 `authStateSkip` → `abort401`
+- **响应**：
+  ```json
+  {
+    "error": "Unauthorized",
+    "errorCode": 401,
+    "errorDescription": "you need to provide a valid access token or user credentials to access this api"
+  }
+  ```
+
+#### 场景 2：Token 非法/无效
+- **触发条件**：携带了 token，但数据库中不存在对应的 Application
+- **处理流程**：`GetApplicationByToken(token)` 返回 `nil` → `handleApplication` 返回 `authStateSkip` → 同场景 1
+- **响应**：同场景 1，401 Unauthorized
+
+#### 场景 3：使用用户凭证（Basic Auth）
+- **触发条件**：请求携带了有效的 Basic Auth 用户凭证
+- **处理流程**：
+  ```go
+  // RequireApplicationToken 中
+  if a.evaluate(ctx, a.handleApplication) {
+      return  // Application Token 验证失败，继续
+  }
+  state, err := a.handleUser()(ctx)
+  if state != authStateSkip {
+      // 用户凭证有效，但不允许用于应用接口
+      a.abort403(ctx)  // 返回 403 Forbidden
+      return
+  }
+  ```
+- **响应**：
+  ```json
+  {
+    "error": "Forbidden",
+    "errorCode": 403,
+    "errorDescription": "you are not allowed to access this api"
+  }
+  ```
+
+### 4.2 Bind 失败路径
+
+#### 场景 4：请求体绑定失败
+- **触发条件**：JSON 格式错误、`message` 字段为空等
+- **处理流程**：
+  ```go
+  // CreateMessage 中
+  if err := ctx.Bind(&message); err == nil {
+      // 正常处理
+  }
+  // Bind 失败时，函数直接返回，没有显式处理
+  // 错误由全局错误中间件处理
+  ```
+
+- **错误处理中间件**（error/handler.go）：
+  ```go
+  func Handler() gin.HandlerFunc {
+      return func(c *gin.Context) {
+          c.Next()
+          if len(c.Errors) > 0 {
+              for _, e := range c.Errors {
+                  switch e.Type {
+                  case gin.ErrorTypeBind:
+                      // 处理验证错误，如 "Field 'message' is required"
+                      writeError(c, strings.Join(stringErrors, "; "))
+                  }
+              }
+          }
+      }
+  }
+  ```
+
+- **响应（以 message 为空为例）**：
+  ```json
+  {
+    "error": "Bad Request",
+    "errorCode": 400,
+    "errorDescription": "Field 'message' is required"
+  }
+  ```
+
+### 4.3 数据库写入失败
+
+#### 场景 5：数据库错误
+- **触发条件**：数据库连接失败、约束冲突等
+- **处理流程**：
+  ```go
+  if success := successOrAbort(ctx, 500, a.DB.CreateMessage(msgInternal)); !success {
+      return
+  }
+  ```
+- **响应**：
+  ```json
+  {
+    "error": "Internal Server Error",
+    "errorCode": 500,
+    "errorDescription": "<具体数据库错误信息>"
+  }
+  ```
+
+---
+
+## 第五部分：WebSocket 实时推送
+
+### 5.1 Notifier 接口
 
 在 `api/message.go` 中定义了 `Notifier` 接口：
 
@@ -285,7 +466,7 @@ type Notifier interface {
 messageHandler := api.MessageAPI{Notifier: streamHandler, DB: db}
 ```
 
-### 4.2 Stream API 通知机制 - api/stream/stream.go
+### 5.2 Stream API 通知机制 - api/stream/stream.go
 
 ```go
 // stream.go:82-91
@@ -305,7 +486,7 @@ func (a *API) Notify(userID uint, msg *model.MessageExternal) {
 2. 遍历每个客户端，将消息写入客户端的 `write` channel
 3. 使用读写锁保证并发安全
 
-### 4.3 WebSocket 客户端连接管理
+### 5.3 WebSocket 客户端连接管理
 
 客户端注册：
 ```go
@@ -330,7 +511,44 @@ type client struct {
 }
 ```
 
-### 4.4 消息写入 WebSocket
+### 5.4 背压语义详解
+
+**核心设计：`write` channel 容量 = 1**
+
+```go
+// stream/client.go:35
+write:   make(chan *model.MessageExternal, 1),
+```
+
+#### 背压机制分析
+
+| 场景 | 行为 | 影响 |
+|------|------|------|
+| 正常流速 | 消息写入 channel，立即被读取发送 | 无阻塞，实时推送 |
+| 客户端网络慢 | channel 满时，`c.write <- msg` 会阻塞 | 阻塞 `Notify` 调用，进而阻塞 HTTP 请求处理 |
+| 客户端已断开 | select 会检测到 write 错误，退出循环 | 连接关闭，从 clients map 中移除 |
+
+**慢连接对系统的影响链：**
+```
+[新消息到达]
+    ↓
+Notify() 尝试写入所有客户端的 write channel
+    ↓
+某客户端网络慢 → channel 已满 → 阻塞
+    ↓
+Notify() 阻塞持有读锁
+    ↓
+其他消息的 Notify() 也被阻塞（等待读锁）
+    ↓
+整个推送系统被慢客户端拖慢
+```
+
+**设计权衡：**
+- 容量 1 意味着**最多缓冲 1 条消息**，保证消息的实时性
+- 牺牲了对慢客户端的容忍度，但避免了内存无限增长
+- 慢客户端会被自动断开（写入超时后连接关闭）
+
+### 5.5 消息写入 WebSocket
 
 每个客户端有独立的写入 goroutine：
 
@@ -361,7 +579,9 @@ func (c *client) startWriteHandler(pingPeriod time.Duration) {
 }
 ```
 
-### 4.5 WebSocket 连接建立
+**写入超时**：`writeWait = 2 * time.Second`，如果 2 秒内无法写入 WebSocket，连接会被关闭。
+
+### 5.6 WebSocket 连接建立
 
 客户端通过 `/stream` 端点建立连接：
 
@@ -394,9 +614,9 @@ func (a *API) Handle(ctx *gin.Context) {
 
 ---
 
-## 第五部分：前端 WebSocket 接收与状态更新
+## 第六部分：前端 WebSocket 接收与状态更新
 
-### 5.1 WebSocket Store - WebSocketStore.ts
+### 6.1 WebSocket Store - WebSocketStore.ts
 
 ```typescript
 // WebSocketStore.ts:16-51
@@ -419,7 +639,7 @@ public listen = (callback: (msg: IMessage) => void) => {
 };
 ```
 
-### 5.2 消息分发 - reactions.ts
+### 6.2 消息分发 - reactions.ts
 
 在应用初始化时注册 WebSocket 监听回调：
 
@@ -440,7 +660,7 @@ const loadAll = () => {
 };
 ```
 
-### 5.3 本地状态更新 - MessagesStore.ts
+### 6.3 本地状态更新 - MessagesStore.ts
 
 收到新消息后更新本地状态：
 
@@ -463,6 +683,35 @@ public publishSingleMessage = (message: IMessage) => {
 3. 使用 `unshift` 将新消息插入列表头部
 4. MobX 响应式更新会自动触发 UI 重渲染
 
+### 6.4 前端一致性机制
+
+**关键设计：sendMessage 不直接更新本地列表，依赖 WebSocket 回流。**
+
+```typescript
+// sendMessage 只发送请求，不修改本地状态
+public sendMessage = async (appId: number, message: string, title: string, priority: number) => {
+    // ... 发送 POST 请求
+    await axios.post(`${config.get('url')}message`, payload, {
+        headers: {'X-Gotify-Key': app.token},
+    });
+    // 注意：这里没有调用 publishSingleMessage！
+    this.snack(`Message sent to ${app.name}`);
+};
+
+// 列表更新完全依赖 WebSocket 推送
+// reactions.ts 中监听 WebSocket，收到消息后调用 publishSingleMessage
+```
+
+**一致性保证：**
+1. **单一数据源**：数据库是唯一真相源，前端状态是数据库的投影
+2. **时序一致性**：WebSocket 推送顺序与数据库写入顺序一致（因为 Notify 在 DB.CreateMessage 之后同步调用）
+3. **失败透明**：如果发送成功但 WebSocket 未收到，用户刷新页面时会从 API 拉取到消息
+4. **乐观提示**：通过 snackbar 提示"Message sent"，用户知道操作已提交
+
+**潜在时序问题：**
+- 如果发送请求返回 200，但 WebSocket 推送丢失，用户会看到提示但列表不更新
+- 解决方式：用户可以手动刷新，或下一次消息推送时重新建立连接
+
 ---
 
 ## 完整链路时序图
@@ -477,20 +726,26 @@ public publishSingleMessage = (message: IMessage) => {
 [HTTP POST /message 携带 X-Gotify-Key 头]
         ↓
 [后端 RequireApplicationToken 中间件验证]
+    ├─ Token 缺失 → 401
+    ├─ Token 无效 → 401
+    └─ 用户凭证命中 → 403
         ↓
 [MessageAPI.CreateMessage 处理]
-    ├─ 绑定请求体
-    ├─ 设置 ApplicationID
+    ├─ Bind 失败 → 400
+    ├─ 强制覆盖 ApplicationID（防伪造）
+    ├─ 强制重置 ID = 0（防伪造）
     ├─ 标题/优先级兜底
     ├─ 转换为内部模型
-    ├─ 写入数据库
+    ├─ 写入数据库 → 失败返回 500
     └─ 调用 Notifier.Notify
         ↓
 [Stream.API.Notify 查找用户的 WebSocket 客户端]
         ↓
 [消息写入每个客户端的 write channel]
+    └─ 慢客户端阻塞 → 可能拖慢系统
         ↓
 [客户端 startWriteHandler 读取 channel 并发送 WebSocket]
+    └─ 写入超时 → 连接关闭
         ↓
 [前端 WebSocketStore 接收消息]
         ↓
@@ -503,14 +758,56 @@ public publishSingleMessage = (message: IMessage) => {
 
 ---
 
+## 主路径 + 失败路径对照小结
+
+### 主路径（成功场景）
+
+| 步骤 | 组件 | 行为 | 成功标志 |
+|------|------|------|---------|
+| 1 | PushMessageDialog | 收集 title/message/priority | message 非空 |
+| 2 | MessagesStore.sendMessage | 组装 payload，携带应用 token 发送 POST | HTTP 200 |
+| 3 | RequireApplicationToken | 验证 Application Token | 认证通过 |
+| 4 | CreateMessage | 绑定请求体，强制覆盖 ApplicationID 和 ID | Bind 成功 |
+| 5 | CreateMessage | 写入数据库 | DB.CreateMessage 成功 |
+| 6 | Stream.API.Notify | 写入各客户端 write channel | 无阻塞 |
+| 7 | client.startWriteHandler | WebSocket 发送消息 | 写入成功 |
+| 8 | WebSocketStore.onmessage | 解析消息 | JSON 解析成功 |
+| 9 | publishSingleMessage | 更新本地状态 | MobX 触发 UI 更新 |
+
+### 失败路径对照
+
+| 失败场景 | 触发点 | HTTP 状态 | 错误信息示例 | 处理方 |
+|---------|--------|-----------|-------------|--------|
+| Token 缺失 | RequireApplicationToken | 401 | you need to provide a valid access token... | 认证中间件 |
+| Token 无效 | RequireApplicationToken | 401 | you need to provide a valid access token... | 认证中间件 |
+| 使用用户凭证 | RequireApplicationToken | 403 | you are not allowed to access this api | 认证中间件 |
+| message 为空 | CreateMessage.Bind | 400 | Field 'message' is required | 全局错误中间件 |
+| JSON 格式错误 | CreateMessage.Bind | 400 | invalid character... | 全局错误中间件 |
+| 数据库错误 | DB.CreateMessage | 500 | <数据库错误详情> | successOrAbort |
+| WebSocket 写入超时 | startWriteHandler | -（连接关闭）| WriteError: ... | 客户端 goroutine |
+
+### 关键安全检查点
+
+| 检查点 | 位置 | 保护目的 |
+|--------|------|---------|
+| ApplicationID 强制覆盖 | CreateMessage:367 | 防止越权发送到其他应用 |
+| ID 强制重置为 0 | CreateMessage:377 | 防止 ID 注入和自增序列破坏 |
+| 仅 Application Token 可发送 | RequireApplicationToken | 权限隔离，防止客户端/用户 token 滥用 |
+| 推送按 UserID 分组 | Stream.API.Notify | 确保只有消息所属用户能收到 |
+
+---
+
 ## 关键设计要点
 
-1. **应用 Token 隔离**：每个应用有独立的 token，发送消息时必须使用对应应用的 token
-2. **双重数据模型**：`MessageExternal` 用于 API 交互，`Message` 用于数据库存储，通过转换函数解耦
-3. **Channel 解耦**：WebSocket 发送通过 channel 异步解耦，不阻塞 HTTP 请求
-4. **按用户分组**：WebSocket 客户端按 userID 分组管理，通知时只需遍历目标用户的连接
-5. **MobX 响应式**：前端使用 MobX 管理状态，消息到达后自动更新 UI
-6. **优雅降级**：标题和优先级都有兜底逻辑，确保消息完整性
+1. **双认证体系**：发送用 Application Token，接收用 Client Token，通过 UserID 关联
+2. **应用 Token 隔离**：每个应用有独立的 token，发送消息时必须使用对应应用的 token
+3. **防伪造保护**：强制覆盖 ApplicationID、重置 ID，确保数据完整性
+4. **双重数据模型**：`MessageExternal` 用于 API 交互，`Message` 用于数据库存储，通过转换函数解耦
+5. **Channel 背压**：WebSocket 发送通过容量为 1 的 channel 异步解耦，慢客户端会被自动断开
+6. **按用户分组**：WebSocket 客户端按 userID 分组管理，通知时只需遍历目标用户的连接
+7. **前端最终一致性**：sendMessage 不直接更新列表，依赖 WebSocket 回流，保证数据来源单一
+8. **MobX 响应式**：前端使用 MobX 管理状态，消息到达后自动更新 UI
+9. **优雅降级**：标题和优先级都有兜底逻辑，确保消息完整性
 
 ---
 
@@ -527,6 +824,8 @@ public publishSingleMessage = (message: IMessage) => {
 | 后端 API | `api/stream/stream.go` | WebSocket 服务端，消息通知 |
 | 后端 API | `api/stream/client.go` | WebSocket 客户端读写循环 |
 | 后端 认证 | `auth/authentication.go` | Token 验证中间件 |
+| 后端 错误处理 | `error/handler.go` | 全局错误处理，Bind 错误格式化 |
 | 后端 数据库 | `database/message.go` | 消息持久化 |
 | 后端 模型 | `model/message.go` | 消息数据结构定义 |
+| 后端 模型 | `model/application.go` | 应用数据结构，含 UserID |
 | 后端 路由 | `router/router.go` | 路由注册与中间件配置 |
