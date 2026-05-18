@@ -80,6 +80,64 @@ type Health struct {
 - `/health` 接口在**数据库初始化完成后**才会注册
 - 服务器启动后即可调用，但数据库连接失败会在步骤 4 `panic`
 
+### 2.7 特殊场景响应行为
+
+#### 2.7.1 数据库初始化失败场景
+
+**核心代码** (`app.go:42-45`):
+```go
+db, err := database.New(...)
+if err != nil {
+    panic(err)  // 进程直接崩溃退出
+}
+```
+
+**可达性分析**：
+- `database.New()` 失败 → 进程 `panic` → `router.Create()` 永不执行 → HTTP 服务器永不启动
+- **结论**：`/health` 接口完全不可达，TCP 连接被拒绝
+
+#### 2.7.2 HTTPS 重定向场景
+
+**重定向中间件** (`router/router.go:45-66`):
+```go
+if conf.Server.SSL.Enabled && conf.Server.SSL.RedirectToHTTPS {
+    g.Use(func(ctx *gin.Context) {
+        if ctx.Request.TLS != nil {
+            ctx.Next()  // 已是 HTTPS，继续处理
+            return
+        }
+        if ctx.Request.Method != http.MethodGet && ctx.Request.Method != http.MethodHead {
+            ctx.Data(http.StatusBadRequest, "text/plain", []byte("Use HTTPS"))
+            ctx.Abort()
+            return
+        }
+        // GET/HEAD 请求 302 重定向到 HTTPS
+        ctx.Redirect(http.StatusFound, fmt.Sprintf("https://%s%s", host, ctx.Request.RequestURI))
+        ctx.Abort()
+    })
+}
+```
+
+**响应行为**（中间件注册在 `/health` 路由之前）：
+
+| 请求方式 | 协议 | 响应行为 |
+|---------|------|----------|
+| GET/HEAD | HTTP | 302 重定向到 HTTPS 同路径 |
+| GET/HEAD | HTTPS | 正常返回健康状态 |
+| 其他方法 | HTTP | 400 Bad Request，响应体 "Use HTTPS" |
+| 其他方法 | HTTPS | 404 Not Found（路由不匹配） |
+
+#### 2.7.3 非 GET/HEAD 请求场景
+
+**路由定义** (`router/router.go:119`):
+```go
+g.Match([]string{"GET", "HEAD"}, "/health", healthHandler.Health)
+```
+
+**响应行为**（无 HTTPS 重定向时）：
+- POST/PUT/DELETE/PATCH 等方法 → 404 Not Found（由 `NoRoute` 处理）
+- 只有 GET 和 HEAD 方法能命中路由
+
 ### 2.6 鉴权分析
 
 - **无需鉴权**：路由注册在认证中间件之前 (`router/router.go:119` 位于 `authentication.Require*` 之前)
