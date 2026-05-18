@@ -537,4 +537,390 @@ authAdmin.DELETE("/:id", userHandler.DeleteUserByID)
 
 ---
 
-## 六
+## 六、侧边导航选中态（深度分析）
+
+### 6.1 核心结论：当前代码**没有实现**选中态高亮
+
+经过全面代码审计，确认 Gotify UI 的侧边导航**没有任何选中态高亮逻辑**。这是让人困惑的根本原因——期望有但实际没有。
+
+**证据链**:
+- ✗ 未使用 `react-router-dom` 的 `NavLink` 组件（会自动添加 `active` 类）
+- ✗ 未调用 `useLocation()` / `useMatch()` 等路由钩子
+- ✗ 未给 `ListItemButton` 传递 `selected` 属性
+- ✗ 项目中无任何 CSS/SCSS 文件定义选中样式
+- ✗ 测试用例中无任何选中态断言
+- ✗ 全局搜索 `selected` / `isSelected` / `aria-selected` 无匹配结果
+
+---
+
+### 6.2 导航组件完整结构
+
+**文件**: `ui/src/layout/Navigation.tsx:1-133`
+
+```typescript
+const Navigation = observer(({loggedIn, navOpen, setNavOpen}: IProps) => {
+    const [showRequestNotification, setShowRequestNotification] =
+        React.useState(mayAllowPermission);
+    const {classes} = useStyles();
+    const {appStore} = useStores();
+    const apps = appStore.getItems();
+
+    const userApps =
+        apps.length === 0
+            ? null
+            : apps.map((app) => (
+                  <Link
+                      onClick={() => setNavOpen(false)}
+                      className={`${classes.link} item`}
+                      to={'/messages/' + app.id}
+                      key={app.id}>
+                      <ListItemButton>
+                          <ListItemAvatar style={{minWidth: 42}}>
+                              <Avatar style={{width: 32, height: 32}} src={app.image} variant="square" />
+                          </ListItemAvatar>
+                          <ListItemText primary={app.name} />
+                      </ListItemButton>
+                  </Link>
+              ));
+
+    return (
+        <ResponsiveDrawer navOpen={navOpen} setNavOpen={setNavOpen} id="message-navigation">
+            <div className={classes.toolbar} />
+            <Link className={classes.link} to="/" onClick={() => setNavOpen(false)}>
+                <ListItemButton disabled={!loggedIn} className="all">
+                    <ListItemText primary="All Messages" />
+                </ListItemButton>
+            </Link>
+            <Divider />
+            <div>{loggedIn ? userApps : placeholderItems}</div>
+            <Divider />
+            {/* 通知按钮... */}
+        </ResponsiveDrawer>
+    );
+});
+```
+
+**关键观察**:
+- 使用普通 `Link` 而非 `NavLink`
+- `ListItemButton` 未接收 `selected` prop
+- 仅通过 `className="item"` 和 `className="all"` 标识，无动态选中类
+
+---
+
+### 6.3 路由切换的实际流程
+
+虽然没有选中态高亮，但路由切换本身是完整的：
+
+```
+用户点击导航项
+    ↓
+<Link to="/messages/1"> 触发路由变化
+    ↓
+React Router 更新 URL 为 /messages/1
+    ↓
+<Routes> 匹配到 /messages/:id
+    ↓
+<Messages> 组件通过 useParams() 获取 id=1
+    ↓
+messagesStore.loadMore(1) 加载对应应用的消息
+    ↓
+页面内容更新，但导航项无视觉变化
+```
+
+**Messages 组件读取路由参数**: `ui/src/message/Messages.tsx:19-27`
+
+```typescript
+const Messages = observer(() => {
+    const {id} = useParams<{id: string}>();
+    const appId = id == null ? -1 : parseInt(id as string, 10);
+    
+    const messages = messagesStore.get(appId);
+    const name = appStore.getName(appId);
+    // ...
+});
+```
+
+---
+
+### 6.4 导航状态与登录态的关联
+
+导航项的显示完全依赖登录态：
+
+| 登录状态 | 导航内容 |
+|---------|---------|
+| `loggedIn = false` | 显示 placeholderItems（"Some Server", "A Raspberry PI"），"All Messages" 按钮 disabled |
+| `loggedIn = true` | 显示真实的用户应用列表（从 appStore 获取） |
+
+**关联代码**: `ui/src/layout/Navigation.tsx:96`
+
+```typescript
+<div>{loggedIn ? userApps : placeholderItems}</div>
+```
+
+appStore 的数据加载由登录态触发：`ui/src/reactions.ts:37-46`
+
+```typescript
+reaction(
+    () => stores.currentUser.loggedIn,
+    (loggedIn) => {
+        if (loggedIn) {
+            stores.appStore.refresh(); // 登录成功后加载应用列表
+        } else {
+            stores.appStore.clear();   // 登出后清空应用列表
+        }
+    }
+);
+```
+
+---
+
+### 6.5 导航状态与后端鉴权的关联
+
+导航项本身不直接参与鉴权，但导航到的页面受后端鉴权保护：
+
+1. **导航可见性**: 未登录时只显示占位项，真实应用列表仅登录后可见
+2. **路由守卫**: 所有导航目标路径（`/`, `/messages/:id`, `/applications` 等）都被 `RequireAuth` 包裹
+3. **API 鉴权**: 页面加载数据时调用的 API（如 `GET /message`, `GET /application`）都需要 `RequireClient` 中间件验证
+
+**后端路由配置**: `router/router.go:185-198`
+
+```go
+clientAuth.Use(authentication.RequireClient)
+clientAuth.GET("/application", applicationHandler.GetApplications)
+clientAuth.GET("/message", messageHandler.GetMessages)
+```
+
+---
+
+### 6.6 导航状态与配置注入的关联
+
+配置注入不直接影响导航选中态，但影响导航相关的功能：
+
+1. **OIDC 配置**: 如果 `config.oidc = true`，登录页会显示 OIDC 登录按钮，但不影响导航本身
+2. **注册配置**: `config.register` 控制是否显示注册按钮，不影响导航
+3. **版本信息**: 显示在 Header 中，与导航无关
+
+---
+
+### 6.7 为什么没有选中态？（设计推测）
+
+可能的原因：
+
+1. **简约设计**: Gotify 是消息推送服务，导航不是核心交互，用户更关注消息内容
+2. **标题替代**: Messages 页面的标题（`DefaultPage title={name}`）已经表明当前位置
+3. **优先级低**: 功能优先级低于消息推送、插件系统等核心功能
+4. **技术债务**: 可能是待实现的功能，目前仅有基础的路由跳转
+
+---
+
+### 6.8 如何添加选中态高亮（实现方案）
+
+如果需要添加选中态高亮，有两种主流方案：
+
+#### 方案 A：使用 NavLink（推荐）
+
+```tsx
+// 修改 Navigation.tsx
+import {NavLink} from 'react-router-dom';
+
+// 对于 "All Messages"
+<NavLink to="/" className={({isActive}) => `${classes.link} ${isActive ? 'active' : ''}`}>
+    <ListItemButton selected={location.pathname === '/'}>
+        <ListItemText primary="All Messages" />
+    </ListItemButton>
+</NavLink>
+
+// 对于应用列表
+{apps.map((app) => (
+    <NavLink
+        key={app.id}
+        to={`/messages/${app.id}`}
+        className={({isActive}) => `${classes.link} item ${isActive ? 'active' : ''}`}>
+        <ListItemButton selected={location.pathname === `/messages/${app.id}`}>
+            {/* ... */}
+        </ListItemButton>
+    </NavLink>
+))}
+```
+
+#### 方案 B：使用 useLocation + 手动判断
+
+```tsx
+import {useLocation} from 'react-router-dom';
+
+const Navigation = observer(({loggedIn, navOpen, setNavOpen}: IProps) => {
+    const location = useLocation();
+    const {appStore} = useStores();
+    const apps = appStore.getItems();
+    
+    const isAppActive = (appId: number) => location.pathname === `/messages/${appId}`;
+    const isAllActive = () => location.pathname === '/';
+    
+    return (
+        <>
+            <Link to="/">
+                <ListItemButton selected={isAllActive()}>
+                    <ListItemText primary="All Messages" />
+                </ListItemButton>
+            </Link>
+            {apps.map((app) => (
+                <Link key={app.id} to={`/messages/${app.id}`}>
+                    <ListItemButton selected={isAppActive(app.id)}>
+                        {/* ... */}
+                    </ListItemButton>
+                </Link>
+            ))}
+        </>
+    );
+});
+```
+
+---
+
+### 6.9 当前选中态问题总结
+
+| 方面 | 状态 |
+|-----|------|
+| 路由跳转 | ✅ 正常工作 |
+| 视觉高亮 | ❌ 未实现 |
+| 无障碍 (aria-selected) | ❌ 未设置 |
+| 键盘导航焦点 | ⚠️ 依赖浏览器默认行为 |
+| 与登录态关联 | ✅ 登录后才显示真实导航项 |
+| 与后端鉴权关联 | ✅ 导航目标受路由守卫保护 |
+
+---
+
+## 七、全局错误处理与重认证
+
+### 7.1 Axios 拦截器
+
+**文件**: `ui/src/apiAuth.ts:5-24`
+
+```typescript
+export const initAxios = (currentUser: CurrentUser, snack: SnackReporter) => {
+    axios.interceptors.response.use(undefined, (error) => {
+        if (!error.response) {
+            snack('Gotify server is not reachable, try refreshing the page.');
+            return Promise.reject(error);
+        }
+        const status = error.response.status;
+        if (status === 401) {
+            currentUser.tryAuthenticate().then(() => snack('Could not complete request.'));
+        }
+        if (status === 400 || status === 403 || status === 500) {
+            snack(error.response.data.error + ': ' + error.response.data.errorDescription);
+        }
+        return Promise.reject(error);
+    });
+};
+```
+
+### 7.2 连接断开自动重连
+
+**文件**: `ui/src/CurrentUser.ts:140-150`
+
+```typescript
+private readonly connectionError = (message: string) => {
+    this.connectionErrorMessage = message;
+    if (this.reconnectTimeoutId !== null) {
+        window.clearTimeout(this.reconnectTimeoutId);
+    }
+    this.reconnectTimeoutId = window.setTimeout(
+        () => this.tryReconnect(true),
+        this.reconnectTime
+    );
+    this.reconnectTime = Math.min(this.reconnectTime * 2, 120000); // 指数退避，最大 2 分钟
+};
+```
+
+---
+
+## 八、状态关联总览
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              前端 UI 层                                 │
+├─────────────────┬─────────────────┬─────────────────┬───────────────────┤
+│   主题管理      │   登录态管理    │  权限提升管理   │  导航状态         │
+│  (localStorage) │  (MobX Store)   │  (MobX Store)   │  (React Router)   │
+└────────┬────────┴────────┬────────┴────────┬────────┴────────┬──────────┘
+         │                 │                 │                 │
+         ▼                 ▼                 ▼                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              React 组件层                                │
+│  Layout (路由守卫) ── Header ── Navigation ── 各业务页面                 │
+└────────┬────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              HTTP 层                                    │
+│  Axios (Cookie 自动携带) ── 拦截器 (401 重认证)                         │
+└────────┬────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              后端 API 层                                │
+│  Gin 中间件 ── Auth 鉴权 ── Session 管理 ── 数据库操作                   │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 九、关键交互流程
+
+### 9.1 页面初始化流程
+
+```
+1. 加载 index.html → 注入 window.config
+2. 初始化所有 Stores
+3. 注册 Axios 拦截器
+4. 调用 currentUser.tryAuthenticate()
+   ├─ 发送 GET /current/user（自动携带 Cookie）
+   ├─ 成功 → loggedIn = true → 加载数据、连接 WebSocket
+   └─ 失败 → loggedIn = false → 路由守卫跳转到 /login
+```
+
+### 9.2 登录流程
+
+```
+用户输入账号密码
+    ↓
+currentUser.login() 发送 POST /auth/local/login (Basic Auth)
+    ↓
+后端验证 → 创建 Client → 设置 Cookie → 返回用户信息
+    ↓
+前端 loggedIn = true → 路由守卫放行 → 加载数据
+```
+
+### 9.3 访问敏感页面（如 /users）
+
+```
+用户访问 /users
+    ↓
+RequireAuth 检查 loggedIn → 未登录跳 /login
+    ↓
+RequireElevation 检查 elevated → 未提升显示 ElevationForm
+    ↓
+用户输入密码提升权限
+    ↓
+elevated = true → 显示用户管理页面
+```
+
+---
+
+## 十、总结
+
+| 状态类型 | 存储方式 | 管理位置 | 后端关联 |
+|---------|---------|---------|---------|
+| 主题 | localStorage | Layout 组件内部 | 无 |
+| 登录态 | MobX (CurrentUser) + HttpOnly Cookie | CurrentUser Store | Session API、Auth 中间件 |
+| 权限提升 | MobX (ElevateStore) + 数据库字段 | ElevateStore | Elevate API、RequireElevatedClient 中间件 |
+| 导航选中 | 无（当前未实现） | - | - |
+
+### 设计特点
+
+1. **安全性**: 使用 HttpOnly Cookie 存储 Token，防止 XSS 攻击
+2. **分层鉴权**: 普通登录 + 权限提升的双因子模式，保护敏感操作
+3. **响应式**: MobX observable + reaction 实现状态变化的自动响应
+4. **容错机制**: 连接断开自动重连（指数退避），401 自动尝试重认证
+5. **配置注入**: 后端动态注入配置，无需前端重新构建
