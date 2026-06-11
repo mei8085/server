@@ -156,13 +156,174 @@ UserExternal **没有可空字段**，所有字段均为值类型且无 `omitemp
 
 > ⚠️ `User` 是 `*UserExternal` 指针且没有 `omitempty`。如果为 nil 会输出 `"user": null`。但当前代码中始终构造非 nil 的 UserExternal，所以实际不会出现 null。
 
+#### 3.8.1 OIDC 响应中 User.CreatedAt 的零值行为（重要）
+
+OIDC 外部 token 交换响应的 User 对象**不是通过 `toExternalUser()` 转换**，而是在 [ExternalTokenHandler](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/api/oidc.go#L380-L383) 中手动构造的：
+
+```go
+ctx.JSON(http.StatusOK, &model.OIDCExternalTokenResponse{
+    Token: client.Token,
+    User:  &model.UserExternal{ID: user.ID, Name: user.Name, Admin: user.Admin},
+})
+```
+
+只显式赋值了 **三个字段**：`ID`、`Name`、`Admin`。`CreatedAt` 没有被赋值，保持 `time.Time` 的零值（Go 中的零时间：`0001-01-01T00:00:00Z`）。
+
+由于 `UserExternal.CreatedAt` 的 json 标签是 `json:"createdAt"`（**无 omitempty**），即使是零值也会被序列化输出。
+
+| 字段 | 理论行为 | OIDC 响应中的实际行为 |
+|---|---|---|
+| CreatedAt | time.Time 零值 → `"0001-01-01T00:00:00Z"` | **始终输出零时间**（与其他 UserExternal 响应不一致） |
+
+> 🔍 **代码不一致性提示**：其他返回 UserExternal 的端点（如 `GET /user/{id}`、`GET /current/user`）均通过 `toExternalUser()` 或完整构造，正确携带了实际的 `CreatedAt`。唯独 OIDC 外部 token 交换响应遗漏了 `CreatedAt` 字段的赋值，导致返回无意义的零时间。
+
 ---
 
-## 4. 消息优先级 Priority 的完整生命周期
+## 4. Token 字段的暴露边界与鉴权过滤机制
+
+尽管 `Application.Token`、`Client.Token`、`PluginConfExternal.Token` 等 token 字段在 DTO 中直接明文展示，但它们的暴露范围受到**四层防护**的严格约束。
+
+### 4.1 第一层：认证中间件（Authentication Middleware）
+
+所有可能返回 token 的 API 端点都受到认证中间件的保护。
+
+| 中间件 | 位置 | 保护的端点 | 说明 |
+|---|---|---|---|
+| `RequireClient` | [auth/authentication.go L52-54](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/auth/authentication.go#L52-L54) | 应用列表、客户端列表、插件列表、消息查询等 | 客户端 token 或 Basic Auth 皆可 |
+| `RequireAdmin` | [auth/authentication.go L46-48](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/auth/authentication.go#L46-L48) | 用户管理、获取指定用户 | 管理员权限，支持 user Basic Auth 或 elevated client token |
+| `RequireElevatedClient` | [auth/authentication.go L57-59](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/auth/authentication.go#L57-L59) | 删除应用/客户端、修改密码等 | 需提权的敏感操作 |
+| `RequireApplicationToken` | [auth/authentication.go L62-76](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/auth/authentication.go#L62-L76) | `POST /message`（发送消息） | 仅应用 token 可访问，用户 auth 会被 403 拒绝 |
+
+认证成功后，认证信息通过 `RegisterUser` / `RegisterClient` / `RegisterApplication` 存储到 gin context 中：[auth/util.go L16-29](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/auth/util.go#L16-L29)。
+
+### 4.2 第二层：用户 ID 推导
+
+无论以何种方式认证，都可以通过 `auth.GetUserID(ctx)` 推导所属用户：
+
+- **User 认证**（Basic Auth）→ `info.user.ID`
+- **Client 认证** → `info.client.UserID`
+- **Application 认证** → `info.app.UserID`
+
+[auth/util.go L39-60](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/auth/util.go#L39-L60)
+
+这确保了后续的数据查询始终有一个明确的用户上下文。
+
+### 4.3 第三层：数据库层按用户过滤
+
+列表查询通过 `GetXxxByUser(userID)` 方法在 SQL 层面过滤，确保用户只能看到自己的数据。
+
+| 数据库方法 | 位置 | 过滤逻辑 |
+|---|---|---|
+| `GetApplicationsByUser(userID)` | [database/application.go L63-66](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/database/application.go#L63-L66) | `WHERE user_id = ?` |
+| `GetClientsByUser(userID)` | [database/client.go L45-48](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/database/client.go#L45-L48) | `WHERE user_id = ?` |
+| `GetMessagesByUser(userID)` | [database/message.go L27-31](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/database/message.go#L27-L31) | `JOIN applications ON app.id = messages.application_id WHERE apps.user_id = ?` |
+| `GetPluginsByUser(userID)` | [database/plugin.go](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/database/plugin.go) | `WHERE user_id = ?` |
+
+示例（应用列表过滤）：
+
+```go
+// database/application.go
+func (d *GormDatabase) GetApplicationsByUser(userID uint) ([]*model.Application, error) {
+    var apps []*model.Application
+    err := d.DB.Where("user_id = ?", userID).Order("sort_key asc").Find(&apps).Error
+    return apps, err
+}
+```
+
+### 4.4 第四层：API 层的所有权校验
+
+单个资源的操作（读取/更新/删除）在 API 层进行所有权二次校验——先通过 ID 查出实体，再比较 `UserID` 是否匹配。
+
+| 操作 | 校验位置 | 校验逻辑 |
+|---|---|---|
+| 获取单条消息 | [api/message.go L186](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/api/message.go#L186) | `app.UserID == auth.GetUserID(ctx)` |
+| 删除单条消息 | [api/message.go L264](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/api/message.go#L264) | `application.UserID == auth.GetUserID(ctx)` |
+| 获取单个应用 | [api/application.go L192](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/api/application.go#L192) | `app.UserID == auth.GetUserID(ctx)` |
+| 更新应用 | [api/application.go L258](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/api/application.go#L258) | `app.UserID == auth.GetUserID(ctx)` |
+| 删除应用 | [api/application.go L333](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/api/application.go#L333) | `app.UserID == auth.GetUserID(ctx)` |
+| 获取单个客户端 | [api/client.go L98](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/api/client.go#L98) | `client.UserID == auth.GetUserID(ctx)` |
+| 更新客户端 | [api/client.go L251](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/api/client.go#L251) | `client.UserID == auth.GetUserID(ctx)` |
+| 删除客户端 | [api/client.go L310](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/api/client.go#L310) | `client.UserID != auth.GetUserID(ctx)` → 404 |
+
+**通用模式**：
+
+```go
+func handler(ctx *gin.Context) {
+    id := parseID(ctx)
+    entity, err := a.DB.GetEntityByID(id)
+    if err != nil || entity == nil {
+        // 返回 404
+    }
+    if entity.UserID != auth.GetUserID(ctx) {
+        // 返回 403 或 404（隐蔽性）
+    }
+    // 正常处理，entity.Token 也会正常输出给调用方
+}
+```
+
+这种"先查再校验"的模式保证了即使攻击者能猜到实体 ID，也无法越权访问他人的 token。
+
+### 4.5 特殊场景：应用 token 只能"用"不能"见"
+
+一个值得注意的设计：应用 token（Application Token）的使用者是应用本身，但应用 token 持有者**看不到自己的 token**。
+
+- `POST /message` 用应用 token 认证 → 可以发送消息，但看不到应用详情
+- 查看应用列表/详情 → 需要 client token 或 Basic Auth 认证 → 才能看到应用的 token
+
+这形成了一条规则：**token 的展示（DTO 中的 token 字段）受客户端/user 认证保护，而 token 的使用（作为认证凭证）是另一回事。**
+
+### 4.6 特殊场景：OIDC 外部 token 响应无鉴权
+
+`POST /auth/oidc/external/token` 端点是**唯一无认证中间件保护**但返回 token 的端点。
+
+它的安全机制是：
+1. 通过 `req.State` 参数查找已存在的 OIDC session（内部状态，由 `/auth/oidc/external/authorize` 生成）
+2. state 是一次性的，使用后即销毁（`popPendingSession`）
+3. 调用方必须持有有效的 `code` 和 `code_verifier`（PKCE 流程）
+4. token 通过 OIDC 服务商验证后，才能换取 Gotify 客户端 token
+
+### 4.7 四层防护总结
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 第一层：认证中间件                                                 │
+│   RequireClient / RequireAdmin / RequireApplicationToken        │
+│   → 无有效凭证直接 401/403                                        │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 第二层：用户 ID 推导                                               │
+│   auth.GetUserID(ctx)                                            │
+│   → 从 user/client/app 认证中统一推出 userID                       │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 第三层：数据库层按用户过滤（列表查询）                                │
+│   GetApplicationsByUser(userID) / GetClientsByUser(userID)      │
+│   → SQL WHERE 条件只返回当前用户的数据                               │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 第四层：API 层所有权校验（单个实体操作）                              │
+│   entity.UserID == auth.GetUserID(ctx)                          │
+│   → 越权访问返回 403/404                                          │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+                    DTO 中的 token 字段可见
+                    （只能看到自己的 token）
+```
+
+---
+
+## 5. 消息优先级 Priority 的完整生命周期
 
 `MessageExternal.Priority` 是项目中**最特殊的可空字段**，其 `*int` 类型既服务于输入语义（区分"未设置"与"明确为零"），又影响了输出的 null 行为。
 
-### 4.1 完整数据流
+### 5.1 完整数据流
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────┐
@@ -218,7 +379,7 @@ UserExternal **没有可空字段**，所有字段均为值类型且无 `omitemp
 └──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 为什么 Priority 使用 `*int` 而非 `int`
+### 5.2 为什么 Priority 使用 `*int` 而非 `int`
 
 `*int` 类型的设计意图仅服务于**输入侧**：
 
@@ -227,7 +388,7 @@ UserExternal **没有可空字段**，所有字段均为值类型且无 `omitemp
 
 如果使用 `int` 类型，则无法区分"用户没传 priority"和"用户传了 priority: 0"这两种情况。
 
-### 4.3 输出侧的实际行为
+### 5.3 输出侧的实际行为
 
 尽管 `json:"priority"` 没有 `omitempty`，理论上 nil 会输出 `"priority": null`，但：
 
@@ -240,9 +401,9 @@ UserExternal **没有可空字段**，所有字段均为值类型且无 `omitemp
 
 ---
 
-## 5. null vs 省略 的完整对照表
+## 6. null vs 省略 的完整对照表
 
-### 5.1 输出 `null` 的字段（指针/切片/Map 类型 + 无 omitempty）
+### 6.1 输出 `null` 的字段（指针/切片/Map 类型 + 无 omitempty）
 
 | DTO | 字段 | 类型 | json 标签 | 何时输出 null |
 |---|---|---|---|---|
@@ -252,7 +413,7 @@ UserExternal **没有可空字段**，所有字段均为值类型且无 `omitemp
 | PluginConfExternal | Capabilities | `[]string` | `json:"capabilities"` | 插件实例返回 nil 切片时 |
 | OIDCExternalTokenResponse | User | `*UserExternal` | `json:"user"` | **当前代码不会产生 null**（始终非 nil），但结构体定义允许 |
 
-### 5.2 省略不出现在 JSON 中的字段（有 omitempty）
+### 6.2 省略不出现在 JSON 中的字段（有 omitempty）
 
 | DTO | 字段 | 类型 | json 标签 | 省略条件 |
 |---|---|---|---|---|
@@ -266,7 +427,7 @@ UserExternal **没有可空字段**，所有字段均为值类型且无 `omitemp
 | PluginConfExternal | Website | `string` | `json:"website,omitempty"` | 插件未提供网站 |
 | PluginConfExternal | License | `string` | `json:"license,omitempty"` | 插件未提供许可证 |
 
-### 5.3 永不输出的字段（json:"-"）
+### 6.3 永不输出的字段（json:"-"）
 
 | DTO | 字段 | 说明 |
 |---|---|---|
@@ -274,7 +435,7 @@ UserExternal **没有可空字段**，所有字段均为值类型且无 `omitemp
 | Application | Messages | 关联消息不随应用返回 |
 | Client | UserID | 用户 ID 不暴露给调用方 |
 
-### 5.4 完全不进入 DTO 的字段（外部模型不定义）
+### 6.4 完全不进入 DTO 的字段（外部模型不定义）
 
 | 内部模型 | 字段 | 原因 |
 |---|---|---|
@@ -289,11 +450,11 @@ UserExternal **没有可空字段**，所有字段均为值类型且无 `omitemp
 
 ---
 
-## 6. 业务逻辑对可空字段的二次控制
+## 7. 业务逻辑对可空字段的二次控制
 
 API 层在序列化前对部分字段做了额外的条件判断，使某些字段在业务上不合理时被主动置为零值/nil，配合 `omitempty` 实现省略：
 
-### 6.1 CurrentUserExternal 的条件填充
+### 7.1 CurrentUserExternal 的条件填充
 
 [GetCurrentUser](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/api/user.go#L129-L148)：
 
@@ -318,7 +479,7 @@ if client != nil {
 | Client Token 认证，提权有效 | client.ID（输出） | 时间指针（输出） |
 | Client Token 认证，提权过期 | client.ID（输出） | nil（omitempty → 省略） |
 
-### 6.2 Client 列表查询中的提权过期清除
+### 7.2 Client 列表查询中的提权过期清除
 
 [GetClients](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/api/client.go#L199-L204)：
 
@@ -332,7 +493,7 @@ for _, client := range clients {
 
 数据库中 `ElevatedUntil` 可能仍存储着已过期的时间戳，但 API 层在返回前主动置为 nil，配合 `json:"elevatedUntil,omitempty"` 使其不出现在 JSON 中。这确保了调用方不会收到语义上已失效的提权信息。
 
-### 6.3 Client.ExpiresAt 的动态计算
+### 7.3 Client.ExpiresAt 的动态计算
 
 [model/client.go](file:///d:/fz/0601-1/solo-dogfeeding/code/12-server/model/client.go#L56-L70)：
 
@@ -352,7 +513,7 @@ func (c *Client) calculateExpiresAt() *time.Time {
 
 ---
 
-## 7. Application.LastUsed 和 Client.LastUsed 为何输出 null 而非省略
+## 8. Application.LastUsed 和 Client.LastUsed 为何输出 null 而非省略
 
 这是项目中**有意的设计选择**，两个 `LastUsed` 字段均使用 `*time.Time` 且**不带 omitempty**：
 
@@ -373,7 +534,7 @@ LastUsed *time.Time `json:"lastUsed"`
 
 ---
 
-## 8. 裁剪规则总结
+## 9. 裁剪规则总结
 
 | 裁剪规则 | 触发机制 | 输出行为 | 典型字段 |
 |---|---|---|---|
