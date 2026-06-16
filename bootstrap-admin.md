@@ -351,6 +351,24 @@ func configFiles() []string {
 3. `/etc/gotify/config.yml`（仅 dev/prod 模式）
 4. struct tag 默认值：`admin` / `admin`
 
+### 第⑦步之后：路径归一化 addTrailingSlashToPaths
+
+`configor.Load` 解析完成后，还有一步收尾处理：
+
+**代码位置**：[config/config.go#L89-L93](config/config.go#L89-L93)
+
+```go
+func addTrailingSlashToPaths(conf *Configuration) {
+    if !strings.HasSuffix(conf.UploadedImagesDir, "/") && !strings.HasSuffix(conf.UploadedImagesDir, "\\") {
+        conf.UploadedImagesDir += string(filepath.Separator)
+    }
+}
+```
+
+- 只处理 `UploadedImagesDir` 一个字段（`PluginsDir` 不处理）
+- 作用：确保路径末尾总有一个分隔符，后面拼接文件名时不需要再加 `/`
+- 与首位管理员注入无直接关系，但属于 `config.Get()` 完整流程的一环
+
 ---
 
 ## 五、数据库初始化核心：database.New
@@ -688,83 +706,148 @@ g.POST("/auth/local/login", sessionHandler.Login)
 
 ---
 
-## 十、登录闭环：bcrypt 校验 → 唯一索引命中 → SecureCookie 签发
+## 十、登录闭环链路（按代码执行顺序逐段拆解）
 
-首启时 `database.New` 将 `admin/admin` 以 bcrypt 密文入库；服务启动后用户通过 `/auth/local/login` 登录时，必须经过完全对称的校验链路才能拿到会话 cookie。本节逐层跟踪这条闭环。
+首启时 `database.New` 把 `admin/admin` 以 bcrypt 密文写进 `users` 表；服务启动后用户通过 `POST /auth/local/login` 登录时，必须经过完全对称的校验链路才能拿到会话 cookie；后续请求再携带 cookie 反向还原身份。以下严格按**代码执行顺序**逐段拆开这条端到端闭环。
 
-### 10.1 入口：SessionAPI.Login
+---
 
-[api/session.go#L56-L100](api/session.go#L56-L100)：
+### 前置 0：登录路由与 SecureCookie 的装配
+
+在进入登录代码之前，先理清 `sessionHandler` 和它的 `SecureCookie` 字段是从哪装配的——这关系到最终签发的 cookie 是否携带 `Secure` 标志。
+
+**代码位置**：[router/router.go#L87-L99](router/router.go#L87-L99) + [router/router.go#L157](router/router.go#L157)
+
+```go
+// router.Create 函数内部
+authentication := auth.Auth{DB: db, SecureCookie: conf.Server.SecureCookie}   // 中间件用
+sessionHandler := api.SessionAPI{
+    DB:            db,
+    NotifyDeleted: streamHandler.NotifyDeletedClient,
+    SecureCookie:  conf.Server.SecureCookie,   // ★ 从 config 透传，默认 false
+}
+// ...
+g.POST("/auth/local/login", sessionHandler.Login)   // 登录端点不挂任何认证中间件（匿名可访问）
+```
+
+`conf.Server.SecureCookie` 来自 [config/config.go#L45](config/config.go#L45)：
+```go
+SecureCookie bool `default:"false"`
+```
+
+- 生产环境启用 HTTPS 后，应通过 `GOTIFY_SERVER_SECURECOOKIE=true` 打开
+- 此值在第⑧步签发 cookie 时被作为 `secure` 参数传入
+- 第⑪步后续请求验证时，此值同样被 `authentication` 用在刷新 cookie 时
+
+---
+
+### 第①步：浏览器请求到达 → SessionAPI.Login
+
+用户在登录框输入 `admin/admin`，Web UI 发起：
+```http
+POST /auth/local/login HTTP/1.1
+Authorization: Basic YWRtaW46YWRtaW4=    ← "admin:admin" 的 base64
+Content-Type: application/x-www-form-urlencoded
+
+name=Browser
+```
+
+命中路由注册 `g.POST("/auth/local/login", sessionHandler.Login)`，进入：
+
+**代码位置**：[api/session.go#L56-L100](api/session.go#L56-L100)
 
 ```go
 func (a *SessionAPI) Login(ctx *gin.Context) {
-    // ① 从 HTTP Basic Auth 取出明文凭据
+    // ── 第②步在此函数开头 ──
     name, pass, ok := ctx.Request.BasicAuth()
-    if !ok { ... abort 401 ... }
-
-    // ② 按用户名查询（命中唯一索引）
-    user, err := a.DB.GetUserByName(name)
-    if err != nil { ... abort 500 ... }
-
-    // ③ bcrypt 比对：数据库密文 vs 请求明文
-    if user == nil || !password.ComparePassword(user.Pass, []byte(pass)) {
-        ctx.AbortWithError(401, errors.New("invalid credentials"))
-        return
-    }
-
-    // ④ 登录成功：创建 Client 记录（会话载体）
-    client := model.Client{
-        Token:                         auth.GenerateNotExistingToken(...),
-        UserID:                        user.ID,
-        ElevatedUntil:                 &elevatedUntil,
-        ExpiresAfterInactivitySeconds: auth.CookieMaxAge,
-    }
-    a.DB.CreateClient(&client)
-
-    // ⑤ 签发 cookie（将 client.Token 写入 Set-Cookie 头）
-    auth.SetCookie(ctx.Writer, client.Token, auth.CookieMaxAge, a.SecureCookie)
-
-    ctx.JSON(200, &model.CurrentUserExternal{...})
+    // ...
 }
 ```
 
-### 10.2 步骤②详解：唯一索引查询
+---
 
-[database/user.go#L9-L19](database/user.go#L9-L19)：
+### 第②步：BasicAuth 解析，取出用户名/密码明文
+
+**代码位置**：[api/session.go#L57-L61](api/session.go#L57-L61)
+
+```go
+name, pass, ok := ctx.Request.BasicAuth()
+if !ok {
+    ctx.AbortWithError(401, errors.New("basic auth required"))
+    return
+}
+```
+
+- `BasicAuth()` 是 Go 标准库 `net/http` 的方法，从 `Authorization: Basic ...` 头中解码 base64，返回 `(username, password, ok)`
+- 解码后得到 `name = "admin"`、`pass = "admin"`，都是**明文**
+- 如果请求不带 `Authorization` 头，直接 401 返回
+
+**和入库侧的衔接**：此时的 `name` 明文，与第 10.5 节 `database.New` 中 `db.Create(User{Name: defaultUser, ...})` 的 `defaultUser`，就是即将通过同一个唯一索引对接的同一个字符串。
+
+---
+
+### 第③步：按用户名查询 → 命中 users 表唯一索引
+
+**代码位置**：[api/session.go#L63-L67](api/session.go#L63-L67)
+
+```go
+user, err := a.DB.GetUserByName(name)   // name = "admin"
+if err != nil {
+    ctx.AbortWithError(500, err)
+    return
+}
+```
+
+跳到 `GetUserByName` 实现：[database/user.go#L9-L19](database/user.go#L9-L19)
 
 ```go
 func (d *GormDatabase) GetUserByName(name string) (*model.User, error) {
     user := new(model.User)
+    // 生成 SQL：SELECT * FROM users WHERE name = ?
     err := d.DB.Where("name = ?", name).Find(user).Error
-    // ...
-    if user.Name == name {
-        return user, err   // ← 命中
+    if err != nil {
+        return nil, err
     }
-    return nil, err        // ← 未找到
+    if user.Name == name {   // 查到了，且 Name 精确匹配（防御脏数据）
+        return user, nil
+    }
+    return nil, nil          // 没查到，返回 (nil, nil)
 }
 ```
 
-生成的 SQL 为 `SELECT * FROM users WHERE name = ?`。`User.Name` 上的 `uniqueIndex:uix_users_name`（[model/user.go#L8](model/user.go#L8)）确保：
-- 查询至多返回一行，不需要全表扫描
-- 与入库时 `db.Create(&model.User{Name: defaultUser, ...})` 写入的行精确对应
+**为什么能精确对应入库时写入的那一行？**
 
-> 入库和查询使用**同一个唯一索引**，保证了"写入的行一定能被查到"的对称性。
-
-### 10.3 步骤③详解：bcrypt 校验对称
-
-入库时（[database/database.go#L97](database/database.go#L97)）：
+看 model 定义 [model/user.go#L8](model/user.go#L8)：
 
 ```go
-Pass: password.CreatePassword(defaultPass, strength)  // bcrypt hash
+Name string `gorm:"type:varchar(180);uniqueIndex:uix_users_name"`
+//                                 ↑↑↑ 唯一索引 uix_users_name
 ```
 
-校验时（[api/session.go#L68](api/session.go#L68)）：
+和入库时写入时的同一字段、同一索引对接：
+
+| 环节 | 代码 | 产生的 SQL | 用到的索引 |
+|---|---|---|---|
+| **首启入库** | `db.Create(User{Name:"admin", ...})` | `INSERT INTO users(name, ...) VALUES ('admin', ...)` | `uix_users_name`（唯一性约束检查） |
+| **登录查询** | `Where("name = ?", "admin").Find(user)` | `SELECT * FROM users WHERE name = 'admin'` | `uix_users_name`（B 树等值查找） |
+
+**结论**：两者共用同一个唯一索引，这是"写进去的那行一定能被查出来"的数据库级保障。
+
+---
+
+### 第④步：bcrypt 校验 → 与入库时 CreatePassword 对称
+
+**代码位置**：[api/session.go#L68-L71](api/session.go#L68-L71)
 
 ```go
-password.ComparePassword(user.Pass, []byte(pass))
+if user == nil || !password.ComparePassword(user.Pass, []byte(pass)) {
+    // ↑ 两种情况二选一就失败：① 用户不存在  ② 密码比对失败
+    ctx.AbortWithError(401, errors.New("invalid credentials"))
+    return
+}
 ```
 
-[auth/password/password.go#L14-L16](auth/password/password.go#L14-L16)：
+**`ComparePassword` 实现**：[auth/password/password.go#L14-L16](auth/password/password.go#L14-L16)
 
 ```go
 func ComparePassword(hashedPassword, password []byte) bool {
@@ -772,142 +855,444 @@ func ComparePassword(hashedPassword, password []byte) bool {
 }
 ```
 
-对称关系：
+**与入库侧 `CreatePassword` 的严格对称**：
 
-| 环节 | 函数 | 输入 | 输出 |
-|------|------|------|------|
-| 入库 | `bcrypt.GenerateFromPassword(plain, cost)` | 明文密码 + cost | `[]byte` 哈希 |
-| 校验 | `bcrypt.CompareHashAndPassword(hash, plain)` | 哈希 + 明文密码 | `nil` (匹配) / error |
+| | 入库 `CreatePassword` | 登录 `ComparePassword` |
+|---|---|---|
+| **代码位置** | [password.go#L5-L12](auth/password/password.go#L5-L12) | [password.go#L14-L16](auth/password/password.go#L14-L16) |
+| **核心调用** | `bcrypt.GenerateFromPassword([]byte("admin"), 10)` | `bcrypt.CompareHashAndPassword(dbHash, []byte("admin"))` |
+| **cost 从哪来** | 第 3 参数 `strength`，来自 `conf.PassStrength`，默认 10 | **不需要传** —— bcrypt 哈希格式 `$2a$10$salt$hash` 中前缀 `$10$` 已编码 cost，Compare 自动提取 |
+| **输入明文** | `"admin"`（从配置 defaultPass 来） | `"admin"`（从 Authorization 头解码来） |
+| **输出** | `[]byte`（形如 `$2a$10$N9qo...` 的 60 字节） | `bool`（匹配 = true，不匹配 = false） |
 
-`CreatePassword` 使用的 `cost` 值被编码在哈希结果的前缀中（`$2a$10$...`），`CompareHashAndPassword` 自动从哈希中提取 cost，无需再次传入。因此**校验侧不受 `PassStrength` 配置变化影响**——即使启动后修改了 `GOTIFY_PASSSTRENGTH`，旧哈希仍可被正确比对。
+**一个容易忽略的设计**：
+- 入库时 cost=10，哈希前缀是 `$2a$10$`
+- 如果之后把 `GOTIFY_PASSSTRENGTH` 改成 12，重启服务后登录，**旧哈希仍然可以正确比对**
+- 因为 `CompareHashAndPassword` 完全不需要知道 cost 参数，全部从哈希前缀中读取
+- 这就是为什么 `PassStrength` 只影响**新哈希的生成**，不影响旧哈希的验证
 
-### 10.4 步骤④⑤详解：Client 创建与 SecureCookie 签发
+---
 
-登录成功后并非直接在 cookie 中写入用户名/密码，而是创建一个 `Client` 记录作为**会话载体**：
+### 第⑤步：解析可选的 name 表单字段（会话显示名）
 
-[api/session.go#L78-L86](api/session.go#L78-L86)：
+**代码位置**：[api/session.go#L73-L76](api/session.go#L73-L76)
 
 ```go
-client := model.Client{
-    Token:                         auth.GenerateNotExistingToken(generateClientToken, a.clientExists),
-    UserID:                        user.ID,
-    ElevatedUntil:                 &elevatedUntil,  // 默认 1 小时提升窗口
-    ExpiresAfterInactivitySeconds: auth.CookieMaxAge, // 7 天不活跃过期
+clientParams := ClientParams{}
+if err := ctx.Bind(&clientParams); err != nil {
+    return
 }
-a.DB.CreateClient(&client)
 ```
 
-[auth/token.go#L43-L45](auth/token.go#L43-L45)：
+`ClientParams` 只有一个字段 `Name`，来自请求体 `application/x-www-form-urlencoded` 的 `name=Browser`。这是用来给新创建的 Client 记录起一个人类可读的名字（如"Chrome on Windows"），**不影响身份认证**，失败时也不会中断登录（`return` 只跳绑定，不写响应，流程继续）。
+
+---
+
+### 第⑥步：构造 Client 会话载体 → 生成唯一 Token
+
+**代码位置**：[api/session.go#L78-L85](api/session.go#L78-L85)
+
+```go
+elevatedUntil := time.Now().Add(model.DefaultElevationDuration)  // 默认 1 小时
+client := model.Client{
+    Name:                          clientParams.Name,                 // 显示名
+    Token:                         auth.GenerateNotExistingToken(     // ★ 核心：生成会话 token
+        generateClientToken, a.clientExists),
+    UserID:                        user.ID,                           // ★ 关联到 admin 的 ID
+    ElevatedUntil:                 &elevatedUntil,                    // 1 小时内可做管理员操作
+    ExpiresAfterInactivitySeconds: auth.CookieMaxAge,                 // 7 天不活动就过期
+}
+```
+
+**Token 生成逻辑**：[auth/token.go#L43-L45](auth/token.go#L43-L45)
 
 ```go
 func GenerateClientToken() string {
-    return generateRandomToken(clientPrefix)  // "C" + 22 位随机字符
+    return generateRandomToken(clientPrefix)   // clientPrefix = "C"
 }
 ```
 
-`client.Token` 是一个 `C` 前缀的随机字符串（约 2^132 密钥空间），存入 `Client` 表后通过 cookie 下发：
+最终 token 形如 `C` + 22 位 base64url 随机字符，密钥空间 ≈ 2^132，且 `GenerateNotExistingToken` 会循环直到拿到一个**不与现有 Client 表冲突**的 token。
 
-[auth/cookie.go#L12-L21](auth/cookie.go#L12-L21)：
+---
+
+### 第⑦步：CreateClient 写入 clients 表 → 命中 Token 唯一索引
+
+**代码位置**：[api/session.go#L86-L88](api/session.go#L86-L88)
 
 ```go
-func SetCookie(w http.ResponseWriter, token string, maxAge int, secure bool) {
-    http.SetCookie(w, &http.Cookie{
-        Name:     CookieName,            // "gotify-client-token"
-        Value:    token,                  // Client.Token，如 "CAbc123..."
-        Path:     "/",
-        MaxAge:   maxAge,                 // 604800 (7天)
-        Secure:   secure,                // 由 GOTIFY_SERVER_SECURECOOKIE 控制
-        HttpOnly: true,                   // JS 不可读
-        SameSite: http.SameSiteStrictMode, // CSRF 防护
-    })
+if success := successOrAbort(ctx, 500, a.DB.CreateClient(&client)); !success {
+    return
 }
 ```
 
-`Secure` 标志来自 [config/config.go#L45](config/config.go#L45) 的 `Server.SecureCookie`（默认 `false`），生产环境启用 HTTPS 后应设为 `true`。
-
-### 10.5 后续请求的 cookie 验证闭环
-
-用户携带 cookie 访问受保护 API 时，[auth/authentication.go#L148-L181](auth/authentication.go#L148-L181) 的 `handleClient` 负责：
-
-```go
-func (a *Auth) handleClient(checks ...) func(...) (...) {
-    return func(ctx *gin.Context) (authState, error) {
-        token, isCookie := a.readTokenFromRequest(ctx)   // ① 从 cookie 读 token
-        client, err := a.DB.GetClientByToken(token)       // ② 查 Client 表
-        RegisterClient(ctx, client)                       // ③ 写入 gin context
-
-        // 如果距上次使用超 5 分钟，刷新 cookie 有效期
-        if client.LastUsed == nil || ... {
-            a.DB.UpdateClientTokensLastUsedAndExpiresAt(...)
-            if isCookie {
-                SetCookie(ctx.Writer, client.Token, CookieMaxAge, a.SecureCookie)
-            }
-        }
-        // 执行权限检查（admin / elevated）
-        for _, check := range checks { ... }
-        return authStateOk, nil
-    }
-}
-```
-
-`Client` 表中的 `Token` 字段也有唯一索引（[model/client.go#L22](model/client.go#L22)）：
+这步把第⑥步构造的 `Client` 持久化到数据库。对应的 model 定义 [model/client.go#L22](model/client.go#L22) 中 Token 字段也有唯一索引：
 
 ```go
 Token string `gorm:"type:varchar(180);uniqueIndex:uix_clients_token"`
 ```
 
-### 10.6 闭环对称总览
-
-```
-            入库阶段（首启）                          登录阶段（运行时）
-  ┌─────────────────────────┐            ┌─────────────────────────────┐
-  │ database.New            │            │ SessionAPI.Login            │
-  │                         │            │                             │
-  │ password.CreatePassword │            │ password.ComparePassword    │
-  │   ("admin", cost=10)    │◄──对称──►  │   (dbHash, "admin")         │
-  │   → $2a$10$xxx         │            │   → true                    │
-  │                         │            │                             │
-  │ db.Create(User{         │            │ DB.GetUserByName("admin")   │
-  │   Name: "admin",       │◄──唯一索──► │   → WHERE name = "admin"    │
-  │   Admin: true,         │    引对接   │   → user.Admin == true      │
-  │   Pass: $2a$10$xxx     │            │                             │
-  │ })                      │            │ DB.CreateClient(&Client{    │
-  │                         │            │   Token: "CAbc123...",      │
-  │                         │            │   UserID: user.ID,          │
-  │                         │            │ })                          │
-  │                         │            │                             │
-  │                         │            │ auth.SetCookie(token, ...)  │
-  │                         │            │   → Set-Cookie: gotify-     │
-  │                         │            │     client-token=CAbc123... │
-  └─────────────────────────┘            └─────────────────────────────┘
-                                                   │
-                                                   ▼
-                                        ┌─────────────────────────────┐
-                                        │ 后续请求（cookie 验证）      │
-                                        │                             │
-                                        │ readTokenFromRequest        │
-                                        │   → cookie: gotify-client- │
-                                        │     token=CAbc123...       │
-                                        │                             │
-                                        │ DB.GetClientByToken(token)  │
-                                        │   → WHERE token = ?         │
-                                        │   → client.UserID           │
-                                        │                             │
-                                        │ checks: admin? elevated?    │
-                                        └─────────────────────────────┘
-```
-
-### 10.7 三个对称保障
-
-| 对称点 | 入库侧 | 校验侧 | 保障机制 |
-|--------|--------|--------|---------|
-| **密码** | `bcrypt.GenerateFromPassword(plain, cost)` → 存 `[]byte` | `bcrypt.CompareHashAndPassword(hash, plain)` → 比对 | bcrypt 自适应算法，cost 编码在哈希前缀中，校验无需再传 cost |
-| **用户名** | `db.Create(User{Name: "admin"})` → 唯一索引写入 | `GetUserByName("admin")` → 唯一索引查询 | `uix_users_name` 保证写入的行一定可被等值查询命中 |
-| **会话** | 登录时 `CreateClient` → `uix_clients_token` 唯一索引写入 | 请求时 `GetClientByToken` → 唯一索引查询 | cookie 中的 token 与 Client 表精确对应，cookie 不是凭据本身 |
+**和后续请求验证的衔接**：
+- 现在 clients 表里有了 `(Token: "CAbc123...", UserID: user.ID, ...)` 一行
+- 第⑪步后续请求的 cookie 中就携带这个 `CAbc123...`，再通过 `GetClientByToken("CAbc123...")` 反向查回这行，从而还原 `UserID`
+- 本质上：`clients` 表是"会话 token → 用户身份"的映射表
 
 ---
 
-## 十一、模块衔接时序图
+### 第⑧步：SetCookie 签发 → 写回 Set-Cookie 响应头
+
+**代码位置**：[api/session.go#L90](api/session.go#L90)
+
+```go
+auth.SetCookie(ctx.Writer, client.Token, auth.CookieMaxAge, a.SecureCookie)
+//           ↑           ↑              ↑                ↑
+//         ResponseWriter  会话 token    7 天 = 604800s    前置 0 中 conf.Server.SecureCookie
+```
+
+**SetCookie 实现**：[auth/cookie.go#L12-L21](auth/cookie.go#L12-L21)
+
+```go
+const CookieName = "gotify-client-token"
+const CookieMaxAge = 604800   // 7 天
+
+func SetCookie(w http.ResponseWriter, token string, maxAge int, secure bool) {
+    http.SetCookie(w, &http.Cookie{
+        Name:     CookieName,            // "gotify-client-token"
+        Value:    token,                 // "CAbc123..."
+        Path:     "/",
+        MaxAge:   maxAge,                // 604800
+        Secure:   secure,                // ← 从配置来，HTTPS 时应为 true
+        HttpOnly: true,                  // JS 不可读，防 XSS 窃取
+        SameSite: http.SameSiteStrictMode, // 严格模式，防 CSRF
+    })
+}
+```
+
+**和入库侧的对称**：
+- 入库时写入 `users` 表（永久身份）
+- 这里写入的是 cookie 中的 `clients.token`（临时会话凭证）
+- 两者通过 `client.UserID = user.ID` 这个外键关系关联，但 cookie 本身**不包含密码、不包含用户名**，只暴露一个不可猜测的随机 token
+
+实际发送的 HTTP 响应头：
+```http
+HTTP/1.1 200 OK
+Set-Cookie: gotify-client-token=CAbc123...; Path=/; Max-Age=604800;
+            HttpOnly; SameSite=Strict
+            ↑ 如果 SecureCookie=true，还会多一个 Secure 标志
+```
+
+---
+
+### 第⑨步：响应 200，登录完成
+
+**代码位置**：[api/session.go#L92-L99](api/session.go#L92-L99)
+
+```go
+ctx.JSON(200, &model.CurrentUserExternal{
+    ID:            user.ID,
+    Name:          user.Name,            // "admin"
+    Admin:         user.Admin,           // true（首启注入时设置的）
+    CreatedAt:     user.CreatedAt,
+    ClientID:      client.ID,            // 新建 Client 的主键
+    ElevatedUntil: client.ElevatedUntil, // 1 小时后需要重新提升
+})
+```
+
+**浏览器端收到的效果**：
+1. 解析 JSON，知道当前用户是 `admin` 且是管理员
+2. 浏览器自动保存 `Set-Cookie` 头中的 cookie
+3. 后续所有对同域的请求，浏览器自动在 `Cookie` 头中附加 `gotify-client-token=CAbc123...`
+
+---
+
+### 第⑩步：后续请求携带 cookie → 路由中间件 RequireClient
+
+用户在浏览器中访问 `/user` 页面，浏览器自动发出：
+
+```http
+GET /user HTTP/1.1
+Cookie: gotify-client-token=CAbc123...
+```
+
+这个端点在 router 中的注册挂了 `authentication.RequireClient` 中间件：
+
+```go
+// 来自 router/router.go 的典型注册
+g.Group("/user").Use(authentication.RequireClient).GET("", userHandler.GetUsers)
+```
+
+中间件 `RequireClient` 实现在 [auth/authentication.go#L52-L54](auth/authentication.go#L52-L54)：
+
+```go
+func (a *Auth) RequireClient(ctx *gin.Context) {
+    // 按以下顺序尝试认证，全部失败就返回 401
+    a.evaluateOr401(ctx,
+        a.handleUser(),       // 第一优先级：Basic Auth（用户名+密码）
+        a.handleClient())     // 第二优先级：Client Token（cookie / header）
+}
+```
+
+这个请求没有 BasicAuth 头，所以 `handleUser` 返回 `authStateSkip`，继续下一个 `handleClient`。
+
+---
+
+### 第⑪步：handleClient 验证 cookie → 还原身份
+
+**代码位置**：[auth/authentication.go#L148-L181](auth/authentication.go#L148-L181)
+
+逐段拆开：
+
+**子步骤 A：从请求中读 token**
+
+```go
+token, isCookie := a.readTokenFromRequest(ctx)
+```
+
+`readTokenFromRequest` 按优先级尝试 4 个来源，本例中命中第 4 个：
+
+```go
+// auth/authentication.go#L210-L229
+func (a *Auth) readTokenFromRequest(ctx *gin.Context) (string, bool) {
+    if token := a.tokenFromQuery(ctx); token != "" { return token, false }       // 1. URL ?token=...
+    if token := a.tokenFromXGotifyHeader(ctx); token != "" { return token, false } // 2. X-Gotify-Key: ...
+    if token := a.tokenFromAuthorizationHeader(ctx); token != "" { return token, false } // 3. Authorization: Bearer ...
+    if token := a.tokenFromCookie(ctx); token != "" { return token, true }        // 4. ★ Cookie 头（本例走这个）
+    return "", false
+}
+
+func (a *Auth) tokenFromCookie(ctx *gin.Context) string {
+    token, err := ctx.Cookie(cookieName)   // cookieName = "gotify-client-token"
+    if err != nil { return "" }
+    return token   // 返回 "CAbc123..."
+}
+```
+
+命中后返回 `(token="CAbc123...", isCookie=true)`。
+
+**子步骤 B：查 clients 表 → 命中 Token 唯一索引**
+
+```go
+client, err := a.DB.GetClientByToken(token)    // token = "CAbc123..."
+if client == nil { return authStateSkip, nil } // token 不存在 → 跳过这个认证方式
+```
+
+生成的 SQL 是 `SELECT * FROM clients WHERE token = ?`，使用的索引正是第⑦步 `CreateClient` 时写入的 `uix_clients_token`，精准命中同一行。
+
+**子步骤 C：把 client 注册到 gin context**
+
+```go
+RegisterClient(ctx, client)   // 后续 handler 用 auth.GetClient(ctx) 就能拿到
+```
+
+**子步骤 D：滑动刷新有效期 + 刷新 cookie**
+
+```go
+now := timeNow()
+if client.LastUsed == nil || client.LastUsed.Add(5*time.Minute).Before(now) {
+    // 距上次使用超 5 分钟：
+    //   1) 刷新 DB 中 LastUsed 和 ExpiresAt
+    a.DB.UpdateClientTokensLastUsedAndExpiresAt([]string{client.Token}, &now)
+    //   2) 如果 token 来自 cookie，重新签发 cookie 刷新 Max-Age
+    if isCookie {
+        SetCookie(ctx.Writer, client.Token, CookieMaxAge, a.SecureCookie)
+        //         ↑ 这里的 a.SecureCookie 就是前置 0 透传的同一值
+    }
+}
+```
+
+**子步骤 E：权限检查（admin / elevated）**
+
+```go
+for _, check := range checks {   // checks 是调用方传入的闭包列表
+    state, err := check(client)  // 例如 checkClientAdmin → 查 users 表看 Admin 是否为 true
+    if state != authStateOk { return state, err }
+}
+return authStateOk, nil
+```
+
+**子步骤 F：中间件放行，执行业务 handler**
+
+`evaluate` 中返回 `authStateOk` → 调用 `ctx.Next()` → 进入 `userHandler.GetUsers`，里面通过 `auth.GetUserID(ctx)` 就能拿到 `client.UserID`，从而知道当前操作的是哪个用户。
+
+---
+
+### 登录闭环的三段对称关系汇总
+
+| 段 | 写入侧（首启或登录时） | 读取侧（登录或后续请求时） | 对称点 |
+|---|---|---|---|
+| **① 用户身份** | `db.Create(User{Name:"admin", Pass:$2a$10..., Admin:true})` 命中 `uix_users_name` | `GetUserByName("admin")` 同一索引查询；`ComparePassword($2a$10..., plain)` 同一 bcrypt 算法 | 同一个唯一索引、同一 bcrypt 哈希对 |
+| **② 会话映射** | `CreateClient(Token:"CAbc123", UserID:user.ID)` 命中 `uix_clients_token` | `GetClientByToken("CAbc123")` 同一索引查询；取出 `UserID` 还原身份 | `clients` 表是 "随机 token → 用户身份" 的可逆映射 |
+| **③ cookie 签发** | `SetCookie(token, secure, HttpOnly, SameSiteStrict)` 写 `Set-Cookie` 头 | `tokenFromCookie()` 读 `Cookie` 头；刷新有效期时再次用同一 `secure` 值重发 | `SecureCookie` 配置在签发侧和刷新侧共享；token 值端到端一致 |
+
+**关键理解**：从"用户输入 admin/admin"到"中间件放行请求"，中间走了两次唯一索引、两次 bcrypt/哈希对称、一次外键关联还原。没有任何一步把明文密码或身份写进 cookie，cookie 只是一个指向映射表的随机索引，这是现代 Web 会话管理的标准做法。
+
+---
+
+## 十一、RequireAdmin 不对称：Basic Auth 直过 vs Cookie Session 需 Elevated
+
+首位管理员入库后 Admin=true，但并不意味着拿着 cookie 就能访问所有管理员接口。RequireAdmin 中间件在 Basic Auth 和 Cookie Session 两条路径上采用**完全不同的判定逻辑**。
+
+### 11.1 RequireAdmin 的两条路径对比
+
+**代码位置**：[auth/authentication.go#L45-L48](auth/authentication.go#L45-L48)
+
+`go
+func (a *Auth) RequireAdmin(ctx *gin.Context) {
+    a.evaluateOr401(ctx,
+        a.handleUser(a.checkUserAdmin),
+        a.handleClient(a.checkClientAdmin, a.checkClientElevated))
+}
+`
+
+| 认证方式 | 判定条件 | 代码位置 |
+|---|---|---|
+| **Basic Auth** | 只需 user.Admin == true | [checkUserAdmin](auth/authentication.go#L270-L275) |
+| **Cookie Session** | 需同时满足：<br> user.Admin == true<br> client.ElevatedUntil 未过期 | [checkClientAdmin](auth/authentication.go#L254-L261) + [checkClientElevated](auth/authentication.go#L263-L268) |
+
+**设计意图**：Basic Auth 每次请求都重验密码，可信度高，直接放行；Cookie Session 是长期会话，敏感操作前需额外"提升（elevate）"一步，类似 sudo。
+
+### 11.2 checkUserAdmin：Basic Auth 路径（只看 Admin 标志）
+
+`go
+func (a *Auth) checkUserAdmin(user *model.User) (authState, error) {
+    if !user.Admin {
+        return authStateForbidden, nil
+    }
+    return authStateOk, nil
+}
+`
+
+只要 user.Admin == true 就放行，无时间窗口限制，无额外提升步骤。
+
+### 11.3 checkClientAdmin + checkClientElevated：Cookie 路径（双重检查）
+
+**第一关：checkClientAdmin  用户必须是管理员**
+
+`go
+func (a *Auth) checkClientAdmin(client *model.Client) (authState, error) {
+    user, err := a.DB.GetUserByID(client.UserID)
+    if !user.Admin {
+        return authStateForbidden, nil
+    }
+    return authStateOk, nil
+}
+`
+
+**第二关：checkClientElevated  会话必须处于提升状态**
+
+`go
+func (a *Auth) checkClientElevated(client *model.Client) (authState, error) {
+    if client.ElevatedUntil == nil || !timeNow().Before(*client.ElevatedUntil) {
+        return authStateNotElevated, nil
+    }
+    return authStateOk, nil
+}
+`
+
+两关是 AND 关系：都通过才放行。
+
+### 11.4 ElevatedUntil 的来源与掉权机制
+
+**来源 1：登录时自动提升 1 小时**
+
+[api/session.go#L78](api/session.go#L78)：
+
+`go
+elevatedUntil := time.Now().Add(model.DefaultElevationDuration)
+`
+
+model.DefaultElevationDuration = 1 小时（见 model/elevate.go）。
+
+**来源 2：OIDC 登录时同样自动提升**
+
+[api/oidc.go#L425](api/oidc.go#L425)，同样 1 小时。
+
+**来源 3：手动提升**
+
+调用提升接口传入 durationSeconds 重置 ElevatedUntil。
+
+**掉权条件**：当前时间 >= ElevatedUntil 时立即掉权，访问 RequireAdmin 接口返回 403，错误 "session not elevated, use basic auth or call /client:elevate"。掉权只影响管理员接口，普通接口不受影响。
+
+### 11.5 与首启 admin 的衔接
+
+首启注入的 dmin 用户 Admin=true，所以：
+- Basic Auth 访问管理员接口  每次都放行
+- Cookie 登录  前 1 小时能访问管理员接口  1 小时后掉权  需重新提升
+
+---
+
+## 十二、OIDC 平行登录入口与 admin 重名场景
+
+本地登录（/auth/local/login）不是唯一入口。conf.OIDC.Enabled = true 时，系统还注册一套 OIDC 登录端点，与本地登录平行共存，共用 users 表和 clients 表。
+
+### 12.1 OIDC 路由注册的条件
+
+**代码位置**：[router/router.go#L119-L127](router/router.go#L119-L127)
+
+`go
+if conf.OIDC.Enabled {
+    oidcHandler := api.NewOIDC(conf, db, userChangeNotifier)
+    oidcGroup := g.Group("/auth/oidc")
+    oidcGroup.GET("/login", oidcHandler.LoginHandler())
+    oidcGroup.GET("/callback", oidcHandler.CallbackHandler())
+    oidcGroup.GET("/elevate", oidcHandler.ElevateHandler)
+}
+`
+
+- OIDC 路由只在启用时注册
+- 本地登录路由始终存在
+- 两者共用 users 表和 clients 表
+
+### 12.2 OIDC 登录流程（与本地登录平行）
+
+| 步骤 | 本地登录 | OIDC 登录 |
+|---|---|---|
+| 入口 | POST /auth/local/login Basic Auth | GET /auth/oidc/login 跳转 Provider |
+| 身份验证 | bcrypt 比对本地密码 | OIDC Provider 验证 |
+| 用户查找 | GetUserByName(name) | esolveUser(info)  GetUserByName |
+| 新用户处理 | 不存在  401 | 不存在且 AutoRegister  自动创建（Admin=false, Pass=nil） |
+| 会话创建 | CreateClient | CreateClient（同一套） |
+| Cookie 签发 | SetCookie | SetCookie（同一函数） |
+| 初始提升 | 1 小时 | 1 小时 |
+
+esolveUser 核心逻辑（[api/oidc.go#L395-L422](api/oidc.go#L395-L422)）：
+
+`go
+func (a *OIDCAPI) resolveUser(info *oidc.UserInfo) (*model.User, int, error) {
+    username := fmt.Sprint(info.Claims[a.UsernameClaim])
+    user, err := a.DB.GetUserByName(username)
+    if user == nil {
+        if !a.AutoRegister { return nil, http.StatusForbidden, errors.New("user not found") }
+        user = &model.User{Name: username, Admin: false, Pass: nil}
+        a.DB.CreateUser(user)
+    }
+    return user, 0, nil
+}
+`
+
+两个入口都通过 GetUserByName 查 users 表，命中同一个 uix_users_name 唯一索引。
+
+### 12.3 admin 重名场景分析
+
+首启注入了本地 admin 账号（Name: "admin", Admin: true）。如果 OIDC Provider 上也有叫 dmin 的用户：
+
+1. OIDC 认证通过，claims 中 preferred_username = "admin"
+2. esolveUser 调 GetUserByName("admin")  命中本地 admin
+3. 拿到 Admin=true 的用户对象
+4. 创建 Client，1 小时提升，签发 cookie
+5. **结果：OIDC 的 admin 用户直接获得 Gotify 管理员权限**
+
+**风险**：若 OIDC Provider 是第三方公共服务，本地恰好有 dmin 用户，可能越权。建议生产环境用 OIDC 时规划好用户名或改名本地 admin。
+
+**反向**：本地 admin 登录不受 OIDC 影响，走 /auth/local/login，两者互相独立。
+
+### 12.4 OIDC 登录后的掉权与提升
+
+OIDC 登录同样 1 小时提升窗口。掉权后走 /auth/oidc/elevate 重新认证刷新 ElevatedUntil，与本地"重新输入密码"平行设计。
+
+---
+
+## 十三、模块衔接时序图
 
 ```
   用户命令行                         app.go                       config                        database
@@ -963,7 +1348,7 @@ Token string `gorm:"type:varchar(180);uniqueIndex:uix_clients_token"`
 
 ---
 
-## 十二、关键设计要点总结
+## 十四、关键设计要点总结
 
 | 设计点 | 实现方式 | 代码位置 |
 |--------|---------|---------|
@@ -982,7 +1367,7 @@ Token string `gorm:"type:varchar(180);uniqueIndex:uix_clients_token"`
 
 ---
 
-## 十三、操作指引：自定义首位管理员
+## 十五、操作指引：自定义首位管理员
 
 无需修改代码，通过以下任一方式覆盖默认凭据：
 
