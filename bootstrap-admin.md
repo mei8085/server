@@ -107,15 +107,33 @@ func Get() *Configuration {
         ENVPrefix: "GOTIFY",
         Silent:    true,
     }).Load(conf, configFiles()...)
-    // configFiles() = ["config.yml", "/etc/gotify/config.yml"]
     return conf
 }
 ```
 
+**configFiles() 分支逻辑**（[config/config.go#L71-L76](config/config.go#L71-L76)）：
+
+```go
+func configFiles() []string {
+    if mode.Get() == mode.TestDev {
+        return []string{"config.yml"}                      // ← 测试模式：仅当前目录
+    }
+    return []string{"config.yml", "/etc/gotify/config.yml"} // ← 生产/开发模式：两处
+}
+```
+
+| 运行模式 | configFiles() 返回值 | 效果 |
+|---------|---------------------|------|
+| `testdev` | `["config.yml"]` | 测试只读当前目录，避免读到系统级残留配置 |
+| `dev` | `["config.yml", "/etc/gotify/config.yml"]` | 开发模式也能读系统配置 |
+| `prod` | `["config.yml", "/etc/gotify/config.yml"]` | 生产标准路径 |
+
+> ⚠️ 之前文档将 `configFiles()` 简写为 `["config.yml", "/etc/gotify/config.yml"]`，未区分 TestDev 分支。实际上 TestDev 模式下**仅读** `config.yml`，不读 `/etc/gotify/config.yml`。
+
 **配置优先级（从高到低）**：
 1. 环境变量：`GOTIFY_DEFAULTUSER_NAME` / `GOTIFY_DEFAULTUSER_PASS`
-2. 当前目录 `config.yml` 的 `defaultUser.name` / `defaultUser.pass`
-3. `/etc/gotify/config.yml`
+2. `config.yml` 的 `defaultUser.name` / `defaultUser.pass`（当前目录）
+3. `/etc/gotify/config.yml`（仅 dev/prod 模式）
 4. struct tag 默认值：`admin` / `admin`
 
 ---
