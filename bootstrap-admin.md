@@ -31,7 +31,7 @@
 
 ## 二、启动入口：app.go:main
 
-文件：[app.go](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/app.go#L29-L60)
+文件：[app.go](app.go#L29-L60)
 
 ### 核心调用链
 
@@ -76,7 +76,7 @@ func main() {
 
 ## 三、配置模块：config.Get
 
-文件：[config/config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/config/config.go#L11-L93)
+文件：[config/config.go](config/config.go#L11-L93)
 
 ### Configuration 结构体关键片段
 
@@ -122,7 +122,7 @@ func Get() *Configuration {
 
 ## 四、数据库初始化核心：database.New
 
-文件：[database/database.go](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/database/database.go#L32-L109)
+文件：[database/database.go](database/database.go#L32-L109)
 
 这是首位管理员入库的**核心函数**，逐段拆解如下。
 
@@ -144,7 +144,7 @@ func New(
 createDirectoryIfSqlite(dialect, connection)
 ```
 
-[database/database.go#L159-L167](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/database/database.go#L159-L167)
+[database/database.go#L159-L167](database/database.go#L159-L167)
 
 仅当使用 `sqlite3` 时，确保 `data/gotify.db` 所在的 `data/` 目录存在，否则 `gorm.Open` 会失败。
 
@@ -191,14 +191,14 @@ if err := db.AutoMigrate(
 }
 ```
 
-[database/database.go#L90-L92](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/database/database.go#L90-L92)
+[database/database.go#L90-L92](database/database.go#L90-L92)
 
 **GORM AutoMigrate 行为**：
 - 表不存在 → CREATE TABLE
 - 表已存在 → 对比字段，仅 ALTER TABLE 增列（不删列、不改类型）
 - 外键约束因配置被禁用（`DisableForeignKeyConstraintWhenMigrating: true`）
 
-**迁移后的 User 表结构**（来自 [model/user.go](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/model/user.go#L6-L15)）：
+**迁移后的 User 表结构**（来自 [model/user.go](model/user.go#L6-L15)）：
 
 ```go
 type User struct {
@@ -233,7 +233,7 @@ if createDefaultUserIfNotExist && userCount == 0 {
 }
 ```
 
-[database/database.go#L94-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/database/database.go#L94-L98)
+[database/database.go#L94-L98](database/database.go#L94-L98)
 
 **幂等性保证**：双重条件 `createDefaultUserIfNotExist == true` 且 `userCount == 0`，确保：
 - 数据库已有任何用户时（不管是不是 admin），**绝不会重复注入**
@@ -241,7 +241,7 @@ if createDefaultUserIfNotExist && userCount == 0 {
 
 ### 4.7 密码加密：password.CreatePassword
 
-文件：[auth/password/password.go](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/auth/password/password.go#L5-L12)
+文件：[auth/password/password.go](auth/password/password.go#L5-L12)
 
 ```go
 func CreatePassword(pw string, strength int) []byte {
@@ -271,9 +271,144 @@ db.Transaction(func(tx *gorm.DB) error { return fillMissingCreatedAt(tx, now()) 
 
 ---
 
-## 五、迁移测试验证：migration_test.go
+## 五、MySQL/Postgres 多副本首启竞态分析
 
-文件：[database/migration_test.go](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/database/migration_test.go#L14-L74)
+### 5.1 问题场景
+
+在 Kubernetes 等编排平台上，多个 Gotify Pod 可能**同时**对同一个 MySQL/Postgres 数据库执行首次启动。此时 `database.New` 中的 Count-then-Create 模式存在经典 TOCTOU（Time-of-Check-to-Time-of-Use）窗口：
+
+```
+  副本 A                              副本 B
+──────────┬──────────────────────────────┬──────────
+           │  Count() → 0                │
+           │  判定: userCount==0         │
+           │                              │  Count() → 0
+           │                              │  判定: userCount==0
+           │  Create(admin)               │
+           │  ★ 成功                      │  Create(admin)
+           │                              │  ★ 违反唯一索引！
+```
+
+### 5.2 代码现状：无显式事务保护
+
+查看 [database/database.go#L94-L98](database/database.go#L94-L98)，Count 和 Create 之间**没有**包裹在数据库事务中：
+
+```go
+userCount := int64(0)
+db.Find(new(model.User)).Count(&userCount)    // ← READ
+if createDefaultUserIfNotExist && userCount == 0 {
+    db.Create(&model.User{                    // ← WRITE
+        Name: defaultUser, Pass: ..., Admin: true,
+    })
+}
+```
+
+对比同文件中 `fillMissingSortKeys` 和 `fillMissingCreatedAt` 使用了 `db.Transaction(..., &sql.TxOptions{Isolation: sql.LevelSerializable})`，而管理员注入**没有使用同等隔离级别**。
+
+### 5.3 实际安全网：唯一索引兜底
+
+竞态的**最终后果**并不严重，因为 `User.Name` 字段有数据库级唯一索引：
+
+```go
+Name string `gorm:"type:varchar(180);uniqueIndex:uix_users_name"`
+```
+
+（见 [model/user.go#L8](model/user.go#L8)）
+
+三方言下的实际表现：
+
+| 方言 | 竞态时第二个 Create 的结果 | 对启动的影响 |
+|------|--------------------------|------------|
+| **SQLite3** | 不可能竞态（`SetMaxOpenConns(1)` 强制串行） | 无影响 |
+| **MySQL** | `INSERT` 触发 `uix_users_name` 唯一约束报错 | GORM 返回 error，但 `database.New` **未检查此 error**，函数正常返回 |
+| **Postgres** | 同上，触发 `23505 unique_violation` | 同上，error 被静默忽略 |
+
+关键细节：[database/database.go#L97](database/database.go#L97) 的 `db.Create(...)` 返回值**未被检查**：
+
+```go
+db.Create(&model.User{Name: defaultUser, Pass: ..., Admin: true})
+// ↑ 返回值 *gorm.DB 被丢弃，Error 字段未被断言
+```
+
+这意味着：
+- 副本 A 成功写入 → 正常
+- 副本 B 违反唯一索引 → `db.Create` 返回 error，但**不阻断启动**
+- 两个副本均正常进入 `router.Create` → 服务可用
+
+### 5.4 竞态结论
+
+| 维度 | 判定 |
+|------|------|
+| **数据正确性** | ✅ 安全。唯一索引保证至多一条 admin 记录，不会产生重复管理员 |
+| **启动健壮性** | ✅ 安全。Create 失败的 error 被忽略，不影响后续流程 |
+| **逻辑严谨性** | ⚠️ 有瑕疵。Count→Create 非原子操作，理论上是 TOCTOU 反模式；更严谨的做法是将整段包裹在 `SERIALIZABLE` 事务中，或使用 `INSERT ... WHERE NOT EXISTS` 的 upsert 模式 |
+| **实际风险** | 极低。多副本同时首启的场景本身罕见，且唯一索引兜底后唯一副作用是日志中出现一条无害的 gorm 写入错误 |
+
+---
+
+## 六、`strength` 与 `createDefaultUserIfNotExist` 形参的设计权衡
+
+### 6.1 `strength` 为什么是形参而非硬编码
+
+[database/database.go#L33](database/database.go#L33) 中 `strength int` 作为 `New` 的形参传入，而不是在 `password.CreatePassword` 内部写死，背后有三层考量：
+
+**（a）性能与安全的可调节点**
+
+bcrypt cost 每增加 1，哈希耗时近似翻倍。不同部署环境对"启动时花 100ms 还是 400ms 做 admin 密码哈希"的容忍度不同：
+
+| cost | 典型耗时 | 适用场景 |
+|------|---------|---------|
+| 5 | ~6ms | 自动化测试（database_test.go 中实际使用 `strength=5`） |
+| 10 | ~100ms | 生产默认值 |
+| 12 | ~400ms | 高安全要求环境 |
+
+将 `strength` 提升为形参，使得 `database.New` 的调用方（[app.go#L47](app.go#L47)）从配置中读取 `PassStrength`，最终来源是 `GOTIFY_PASSSTRENGTH` 环境变量或 `passStrength` 配置项。用户无需重编译即可调节。
+
+**（b）测试友好**
+
+[database/database_test.go#L33](database/database_test.go#L33) 和 [database/migration_test.go#L46](database/migration_test.go#L46) 都使用 `strength=5` 调用 `New`：
+
+```go
+db, err := New("sqlite3", ..., "defaultUser", "defaultPass", 5, true, fixedNow)
+```
+
+如果 `password.CreatePassword` 内部硬编码 cost=10，每个测试用例仅初始化数据库就要多花 10 倍时间。形参化后测试可以降 cost，CI 速度不受 bcrypt 影响。
+
+**（c）职责分离**
+
+`database.New` 不应替业务方决定"多安全算够安全"。密码策略属于运维领域，应归入配置层；`database.New` 只负责"接收强度值、传给哈希函数"，保持数据层的单一职责。
+
+### 6.2 `createDefaultUserIfNotExist` 为什么是形参而非内部判定
+
+[database/database.go#L33](database/database.go#L33) 中 `createDefaultUserIfNotExist bool` 的设计意图：
+
+**（a）使"是否注入"可被测试显式控制**
+
+如果不设此参数，`database.New` 将永远执行空库检测并注入——测试中无法关闭此行为。形参化后，测试可以传 `false` 来创建不含默认用户的干净数据库，再验证自定义用户逻辑。
+
+**（b）预留禁用入口**
+
+虽然当前 [app.go#L47](app.go#L47) 始终传入 `true`，但形参的存在使得：
+- 运维可通过修改一行调用关闭自动注入，强制走 OIDC 或 LDAP 的外部身份源
+- 未来版本可引入 `--no-bootstrap` 命令行参数，透传到此处为 `false`
+
+**（c）为什么不反过来——在 `New` 内部检测配置**
+
+一种替代设计是在 `database.New` 内部读取全局配置来决定是否注入。但这样做的代价是：
+- `database` 包对 `config` 包产生反向依赖，破坏分层（`config` → `database` 的单向依赖变为双向）
+- `New` 函数签名隐去了注入开关，调用方无法从签名上理解行为，可读性变差
+
+将控制权以形参形式上提至调用方，保持了 `database` 包的独立性和 `New` 函数的"纯数据层"定位。
+
+**（d）与 `now func() time.Time` 同一设计哲学**
+
+`now` 参数和 `createDefaultUserIfNotExist` 遵循同一原则：**将所有可能影响行为的外部因素显式化为形参**，使得 `New` 的行为完全由入参决定，无隐式的全局状态依赖。这是 Go 标准库风格（如 `httputil.ReverseProxy` 的 `Director` 参数）的惯用做法。
+
+---
+
+## 七、迁移测试验证：migration_test.go
+
+文件：[database/migration_test.go](database/migration_test.go#L14-L74)
 
 测试用例 `TestMigration` 完整验证了引导逻辑：
 
@@ -303,11 +438,11 @@ if user, err := db.GetUserByName("test_user"); assert.NoError(s.T(), err) {
 
 ---
 
-## 六、路由与服务启动（后续衔接）
+## 八、路由与服务启动（后续衔接）
 
-### 6.1 router.Create
+### 8.1 router.Create
 
-文件：[router/router.go](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/router/router.go#L28-L248)
+文件：[router/router.go](router/router.go#L28-L248)
 
 数据库就绪后，路由层将 `db` 注入各 API Handler：
 
@@ -320,15 +455,15 @@ g.POST("/auth/local/login", sessionHandler.Login)
 
 此时数据库中已存在首位管理员，用户可通过 Web UI 或 API 以 `admin/admin` 登录。
 
-### 6.2 runner.Run
+### 8.2 runner.Run
 
-文件：[runner/runner.go](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/runner/runner.go#L20-L61)
+文件：[runner/runner.go](runner/runner.go#L20-L61)
 
 启动 HTTP(S) 监听器，将 gin engine 挂载到 `http.Server`，开始对外提供服务。
 
 ---
 
-## 七、模块衔接时序图
+## 九、模块衔接时序图
 
 ```
   用户命令行                         app.go                       config                        database
@@ -377,21 +512,23 @@ g.POST("/auth/local/login", sessionHandler.Login)
 
 ---
 
-## 八、关键设计要点总结
+## 十、关键设计要点总结
 
 | 设计点 | 实现方式 | 代码位置 |
 |--------|---------|---------|
-| **凭据来源多层级** | 环境变量 > config.yml > struct tag 默认值 | [config.go#L79-L87](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/config/config.go#L79-L87) |
-| **幂等注入** | 双重条件：`createDefaultUserIfNotExist && userCount == 0` | [database.go#L94-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/database/database.go#L94-L98) |
-| **密码安全存储** | bcrypt 哈希，默认 cost=10，明文不落库 | [password.go#L5-L12](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/auth/password/password.go#L5-L12) |
-| **迁移与注入顺序** | AutoMigrate → 计数 → 注入（先建表再写数据） | [database.go#L90-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/database/database.go#L90-L98) |
-| **数据库方言兼容** | MySQL / PostgreSQL / SQLite3 统一入口 | [database.go#L52-L59](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/database/database.go#L52-L59) |
-| **SQLite 并发保护** | `SetMaxOpenConns(1)` 强制串行写 | [database.go#L74-L80](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/database/database.go#L74-L80) |
-| **唯一性约束** | `Name` 字段 `uniqueIndex`，即使并发也不重复 | [user.go#L8](file:///d:/fz/0601-2/solo-dogfeeding/code/5-server/model/user.go#L8) |
+| **凭据来源多层级** | 环境变量 > config.yml > struct tag 默认值 | [config.go#L79-L87](config/config.go#L79-L87) |
+| **幂等注入** | 双重条件：`createDefaultUserIfNotExist && userCount == 0` | [database.go#L94-L98](database/database.go#L94-L98) |
+| **多副本竞态兜底** | `User.Name` 唯一索引 + Create error 被静默忽略 | [user.go#L8](model/user.go#L8)、[database.go#L97](database/database.go#L97) |
+| **密码安全存储** | bcrypt 哈希，默认 cost=10，明文不落库 | [password.go#L5-L12](auth/password/password.go#L5-L12) |
+| **强度可配置** | `strength` 形参化，测试用 5，生产用 10 | [database.go#L33](database/database.go#L33) |
+| **注入开关可控制** | `createDefaultUserIfNotExist` 形参化，避免全局状态耦合 | [database.go#L33](database/database.go#L33) |
+| **迁移与注入顺序** | AutoMigrate → 计数 → 注入（先建表再写数据） | [database.go#L90-L98](database/database.go#L90-L98) |
+| **数据库方言兼容** | MySQL / PostgreSQL / SQLite3 统一入口 | [database.go#L52-L59](database/database.go#L52-L59) |
+| **SQLite 并发保护** | `SetMaxOpenConns(1)` 强制串行写 | [database.go#L74-L80](database/database.go#L74-L80) |
 
 ---
 
-## 九、操作指引：自定义首位管理员
+## 十一、操作指引：自定义首位管理员
 
 无需修改代码，通过以下任一方式覆盖默认凭据：
 
