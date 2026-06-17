@@ -60,7 +60,7 @@ axios.interceptors.response.use(undefined, (error) => {
 | HTTP 状态 | 场景 | Snackbar 内容 |
 |-----------|------|---------------|
 | 无响应（网络错误） | 服务器不可达 / 断网 | `Gotify server is not reachable, try refreshing the page.` |
-| 401 Unauthorized | 鉴权失效 | 先尝试重鉴权，**无论成功或失败**都会提示 `Could not complete request.` |
+| 401 Unauthorized | 鉴权失效 | 先尝试重鉴权，**成功后**提示 `Could not complete request.` |
 | 400 Bad Request | 请求参数错误 | `{error}: {errorDescription}` |
 | 403 Forbidden | 权限不足 | `{error}: {errorDescription}` |
 | 500 Internal Server Error | 服务端异常 | `{error}: {errorDescription}` |
@@ -315,7 +315,7 @@ SnackManager 单例
 
 ### 3.3 业务优先级（priority 字段）
 
-**重要结论**：消息的 `priority` 字段**不影响 Snackbar 的显示顺序**，Snackbar 严格按入队时间 FIFO。
+**重要结论**：消息的 `priority` 字段**不影响 Snackbar 的显示顺序**。当显示数未达 maxSnack 时按入队时间显示，达上限后新入队会挤掉最老的，因此不保证严格 FIFO。
 
 priority 影响的是另外三个独立通道：
 
